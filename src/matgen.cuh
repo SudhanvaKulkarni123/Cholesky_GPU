@@ -1,145 +1,298 @@
-// generate_matrix.cu
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
 #include "kernels_macros.cuh"
 
+double estimateConditionNumber(double* dA,
+                               int n,
+                               cusolverDnHandle_t cusolverH,
+                               cudaStream_t stream)
+{
+    // 1. Copy dA -> d_workA (so we don't destroy dA)
+    double* d_workA = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_workA, n*n*sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_workA, dA, n*n*sizeof(double), cudaMemcpyDeviceToDevice));
 
-void generateMatrix(int n, double** d_A_out) {
-    cusolverDnHandle_t cusolverH = nullptr;
-    cublasHandle_t cublasH = nullptr;
-    CUDA_CHECK(cudaSetDevice(0));
-    CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
-    CUBLAS_CHECK(cublasCreate(&cublasH));
+    // 2. Allocate space for eigenvalues
+    double* d_W = nullptr;  // holds eigenvalues
+    CUDA_CHECK(cudaMalloc((void**)&d_W, n*sizeof(double)));
 
-    // Allocate host memory for a random n-by-n matrix.
-    double* h_A = (double*)malloc(n * n * sizeof(double));
-    if (h_A == nullptr) {
-        fprintf(stderr, "Failed to allocate host memory.\n");
-        exit(EXIT_FAILURE);
+    // 3. Create devInfo and query workspace size
+    int* devInfo = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&devInfo, sizeof(int)));
+    
+    int lwork = 0;
+    // We only need eigenvalues, but must choose EIG_MODE_VECTOR or NOVECTOR
+    // Either is fine if we only care about the eigenvalues, but 'VECTOR' can help
+    // preserve the full result if needed. We'll do EIG_MODE_NOVECTOR for minimal overhead.
+    cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_NOVECTOR;
+
+    // We'll assume the matrix is stored in lower or upper. Typically, for SPD, we use
+    // the lower triangular part. But syevd can handle either. Let's pick 'LOWER'.
+    CUSOLVER_CHECK( cusolverDnDsyevd_bufferSize(
+        cusolverH,
+        jobz,
+        CUBLAS_FILL_MODE_LOWER,
+        n,
+        d_workA,
+        n,
+        d_W,
+        &lwork
+    ));
+
+    double* d_work = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_work, lwork*sizeof(double)));
+
+    // 4. Compute eigenvalues in d_W (d_workA gets overwritten)
+    CUSOLVER_CHECK( cusolverDnDsyevd(
+        cusolverH,
+        jobz,
+        CUBLAS_FILL_MODE_LOWER,
+        n,
+        d_workA, // overwritten
+        n,
+        d_W,
+        d_work,
+        lwork,
+        devInfo
+    ));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 5. Check devInfo
+    int info = 0;
+    CUDA_CHECK(cudaMemcpy(&info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    if(info != 0) {
+        std::cerr << "dsyevd failed with devInfo = " << info << std::endl;
+        // Clean up and return something safe
+        cudaFree(d_workA);
+        cudaFree(d_W);
+        cudaFree(d_work);
+        cudaFree(devInfo);
+        return -1.0;
     }
 
+    // 6. Copy eigenvalues back to host
+    std::vector<double> h_W(n);
+    CUDA_CHECK(cudaMemcpy(h_W.data(), d_W, n*sizeof(double), cudaMemcpyDeviceToHost));
 
-    
-    // Allocate device memory for the input matrix.
-    double* d_A = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_A, n * n * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, n * n * sizeof(double), cudaMemcpyHostToDevice));
-        // Fill with random values.
-    curandGenerator_t gen;
-    CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+    // Eigenvalues are returned in ascending order => W[0]..W[n-1]
+    double lambda_min = h_W[0];
+    double lambda_max = h_W[n-1];
 
-    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, 1234ULL));
+    // Condition number ~ (lambda_max / lambda_min)
+    double condNum = (lambda_min > 0.0) ? (lambda_max / lambda_min) : -1.0;
+
+    // Cleanup
+    CUDA_CHECK(cudaFree(d_workA));
+    CUDA_CHECK(cudaFree(d_W));
+    CUDA_CHECK(cudaFree(d_work));
+    CUDA_CHECK(cudaFree(devInfo));
+
+    return condNum;
+}
 
 
-    CURAND_CHECK(curandGenerateNormalDouble(gen, d_A, n, 0.0, 1.0));
+void randomOrthonormalMatrix(double* d_Q, int n, 
+                             cusolverDnHandle_t cusolverH, 
+                             cudaStream_t stream)
+{
+    // (A) Allocate host memory for M, fill with randoms
+    std::vector<double> h_M(n*n);
+    std::srand(static_cast<unsigned>(123444));
+    for(int i = 0; i < n*n; ++i){
+        h_M[i] = static_cast<double>(rand()) / RAND_MAX;
+    }
 
-    // --- Compute QR factorization to obtain Q ---
-    // Allocate space for tau vector (length = n).
-    double* d_tau = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_tau, n * sizeof(double)));
+    // (B) Copy M to device
+    double* d_M = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_M, n*n*sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_M, h_M.data(), n*n*sizeof(double), cudaMemcpyHostToDevice));
 
-    // Query workspace size for geqrf.
+    // (C) QR factorization via cuSOLVER
     int work_size = 0;
-    CUSOLVER_CHECK(cusolverDnDgeqrf_bufferSize(cusolverH, n, n, d_A, n, &work_size));
-    double* d_work = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_work, work_size * sizeof(double)));
-
-    // Allocate device memory for devInfo.
     int* devInfo = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&devInfo, sizeof(int)));
 
-    // Compute QR factorization: d_A will contain R in the upper triangle and Householder vectors in the lower triangle.
-    CUSOLVER_CHECK(cusolverDnDgeqrf(cusolverH, n, n, d_A, n, d_tau, d_work, work_size, devInfo));
-    int info = 0;
-    CUDA_CHECK(cudaMemcpy(&info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
-    if (info != 0) {
-        fprintf(stderr, "QR factorization failed, info = %d\n", info);
-        exit(EXIT_FAILURE);
-    }
-    
-    // Generate Q explicitly from the output of geqrf.
-    CUSOLVER_CHECK(cusolverDnDorgqr(cusolverH, n, n, n, d_A, n, d_tau, d_work, work_size, devInfo));
-    CUDA_CHECK(cudaMemcpy(&info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
-    if (info != 0) {
-        fprintf(stderr, "Generating Q failed, info = %d\n", info);
-        exit(EXIT_FAILURE);
-    }
-    // Now, d_A contains the orthonormal matrix Q.
+    // 1. Query buffer size
+    CUSOLVER_CHECK( cusolverDnDgeqrf_bufferSize(cusolverH, n, n, d_M, n, &work_size) );
+    double* d_work = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_work, work_size * sizeof(double)));
 
-    // --- Create diagonal Sigma ---
-    // On the host, form sigma[i] = 1/(i+1).
-    double* h_sigma = (double*)malloc(n * sizeof(double));
-    if (h_sigma == nullptr) {
-        fprintf(stderr, "Failed to allocate h_sigma.\n");
-        exit(EXIT_FAILURE);
+    // ================================
+    // Use DEVICE memory for tau
+    double* d_tau = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_tau, n * sizeof(double)));
+    // ================================
+
+    // 2. Factor M in-place => M = Q * R  (geqrf)
+    CUSOLVER_CHECK(cusolverDnDgeqrf(
+        cusolverH, 
+        n, n, 
+        d_M, n, 
+        d_tau,         // <--- DEVICE pointer for tau
+        d_work, work_size, 
+        devInfo
+    ));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // check info
+    int infoQR = 0;
+    CUDA_CHECK(cudaMemcpy(&infoQR, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    if(infoQR != 0){
+        std::cerr << "QR factorization failed. devInfo=" << infoQR << std::endl;
     }
-    for (int i = 0; i < n; i++) {
-        h_sigma[i] = 1.0 / (i + 1);
+
+    // 3. Extract Q (orgqr)
+    CUSOLVER_CHECK(cusolverDnDorgqr(
+        cusolverH,
+        n,  // m
+        n,  // n
+        n,  // k
+        d_M, n,
+        d_tau,       // <--- DEVICE pointer for tau
+        d_work, work_size,
+        devInfo
+    ));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int infoOrgqr = 0;
+    CUDA_CHECK(cudaMemcpy(&infoOrgqr, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    if(infoOrgqr != 0){
+        std::cerr << "orgqr failed. devInfo=" << infoOrgqr << std::endl;
     }
-    double* d_sigma = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_sigma, n * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_sigma, h_sigma, n * sizeof(double), cudaMemcpyHostToDevice));
 
-    // --- Form B = Q * Sigma ---
-    // We want to multiply each column j of Q by sigma[j]. Since Q is in d_A,
-    // we allocate a new matrix d_Q to store the scaled Q.
-    double* d_Q = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_Q, n * n * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_Q, d_A, n * n * sizeof(double), cudaMemcpyDeviceToDevice));
-    // For each column j, scale d_Q(:,j) by sigma[j].
-    for (int j = 0; j < n; j++) {
-        // Pointer to the j-th column is d_Q + j*n.
-        // Note: cublasDscal scales a vector of length n.
-        CUBLAS_CHECK(cublasDscal(cublasH, n, &h_sigma[j], d_Q + j * n, 1));
-    }
-    // At this point, d_Q = Q * diag(sigma).
+    // Now d_M holds Q
+    CUDA_CHECK(cudaMemcpy(d_Q, d_M, n*n*sizeof(double), cudaMemcpyDeviceToDevice));
 
-    // --- Compute A = B * Q^T, where B = d_Q and Q is still in d_A ---
-    double* d_A_out_local = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&d_A_out_local, n * n * sizeof(double)));
-    double alpha = 1.0, beta = 0.0;
-    CUBLAS_CHECK(cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_T,
-                             n, n, n,
-                             &alpha,
-                             d_Q, n,
-                             d_A, n,
-                             &beta,
-                             d_A_out_local, n));
-    // Now, d_A_out_local contains A = Q * diag(sigma) * Q^T.
-
-    // Return the result.
-    *d_A_out = d_A_out_local;
-
-    // --- Clean up ---
-    free(h_A);
-    free(h_sigma);
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_tau));
+    // cleanup
+    CUDA_CHECK(cudaFree(d_M));
     CUDA_CHECK(cudaFree(d_work));
+    CUDA_CHECK(cudaFree(d_tau));   // free device tau
     CUDA_CHECK(cudaFree(devInfo));
-    CUDA_CHECK(cudaFree(d_sigma));
-    CUDA_CHECK(cudaFree(d_Q));
-    CUSOLVER_CHECK(cusolverDnDestroy(cusolverH));
-    CUBLAS_CHECK(cublasDestroy(cublasH));
 }
 
-// Test main to call generateMatrix and print a few entries.
-int main() {
-    int n = 8;  // For demonstration, use a small matrix.
-    double* d_A = nullptr;
-    generateMatrix(n, &d_A);
 
-    // Copy the generated matrix back to host and print it.
-    double* h_A = (double*)malloc(n * n * sizeof(double));
-    CUDA_CHECK(cudaMemcpy(h_A, d_A, n * n * sizeof(double), cudaMemcpyDeviceToHost));
+// ---------------------------------------------------------------------------
+// Distribution type
+enum class DistType {
+    Geometric,
+    Arithmetic
+};
 
-    printf("Generated matrix A = Q * Sigma * Q^T:\n");
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            printf("%8.4f ", h_A[i + j * n]);  // Column-major print.
-        }
-        printf("\n");
+// ---------------------------------------------------------------------------
+// 5. Generate a PSD matrix A = Q * Lambda * Q^T on the device.
+//
+// dA:      (output) device pointer for NxN matrix
+// n:       dimension
+// condVal: desired condition number
+// dist:    pick geometric or arithmetic distribution
+//
+void generatePSD(double* dA, 
+                 int n, 
+                 double condVal, 
+                 DistType dist,
+                 cublasHandle_t cublasH,
+                 cusolverDnHandle_t cusolverH,
+                 cudaStream_t stream)
+{
+    // 0. constants
+    const double alpha = 1.0;
+    const double beta  = 0.0;
+
+    // 1. Allocate device memory for Q
+    double* d_Q = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_Q, n*n*sizeof(double)));
+
+    double* d_buff = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_buff, n*n*sizeof(double)));
+
+    double* debug_arr = (double*) malloc(n*sizeof(double));
+
+    // 2. Generate random orthonormal Q
+    randomOrthonormalMatrix(d_Q, n, cusolverH, stream);
+
+    CUBLAS_CHECK(cublasSetStream(cublasH, stream));
+
+
+    //check if mat is orth
+    double* debug_mat = nullptr;
+    CUDA_CHECK(cudaMalloc((void**) &debug_mat, n*n*sizeof(double)));
+    CUBLAS_CHECK(cublasDgemm(
+        cublasH,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        n,
+        n,
+        &alpha,
+        d_Q, n,
+        d_Q, n, 
+        &beta,
+        debug_mat, n
+    ));
+
+
+    // 3. Allocate diagonal array d_diagVals (size n)
+    double* d_diagVals = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_diagVals, n*n*sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_diagVals, 0, n * n * sizeof(double)));
+
+    // 3a. Copy condVal to device
+    double* d_cond = nullptr;
+    CUDA_CHECK(cudaMalloc((void**)&d_cond, sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_cond, &condVal, sizeof(double), cudaMemcpyHostToDevice));
+
+    // 4. Fill diagVals with chosen distribution
+    int blockSize = 256;
+    int gridSize  = (n + blockSize - 1) / blockSize;
+
+    if(dist == DistType::Geometric) {
+        construct_diag_geom<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+    } else {
+        construct_diag_arith<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+ 
+    CUBLAS_CHECK(cublasDgemm( 
+        cublasH, 
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        n,
+        n,
+        n,
+        &alpha,
+        d_diagVals, n,
+        d_Q, n,
+        &beta,
+        d_buff, n
+    ));
 
-    free(h_A);
-    CUDA_CHECK(cudaFree(d_A));
-    return 0;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 6. Now compute A = (Q * diag) * Q^T
+    //    i.e. gemm( Q, Q^T ) with cublas
+
+    CUBLAS_CHECK(cublasDgemm(
+        cublasH,
+        CUBLAS_OP_T,   // Q not transposed
+        CUBLAS_OP_N,   // Q^T
+        n,             // m
+        n,             // n
+        n,             // k
+        &alpha,
+        d_Q, n,
+        d_buff, n,
+        &beta,
+        dA, n
+    ));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // cleanup
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_diagVals));
+    CUDA_CHECK(cudaFree(d_cond));
+    CUDA_CHECK(cudaFree(d_buff));
 }
