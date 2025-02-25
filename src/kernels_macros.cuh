@@ -13,6 +13,10 @@
 #include <curand.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/numeric_conversion.h>
 
 namespace cg = cooperative_groups;
@@ -34,8 +38,8 @@ using namespace std;
     do {                                                            \
         cublasStatus_t s = (err);                                   \
         if (s != CUBLAS_STATUS_SUCCESS)  {                          \
-            fprintf(stderr, "cuBLAS error %s:%d\n",                 \
-                    __FILE__, __LINE__);                            \
+            fprintf(stderr, "cuBLAS error %s:%d : %d\n",                 \
+                    __FILE__, __LINE__, s);                            \
             exit(EXIT_FAILURE);                                     \
         }                                                           \
     } while(0)
@@ -72,7 +76,7 @@ void perm_to_ind(vector<int>& perm, vector<int>& ind, int n) {
     }
 }
 
-__device__ uint8_t float_to_fp8(float val) {
+__device__ cutlass::float_e4m3_t float_to_fp8(float val) {
     cutlass::NumericConverter<cutlass::float_e4m3_t, float> converter;
     return converter(val);
 }
@@ -104,7 +108,7 @@ __global__ void convertFloattoDouble(const float* __restrict__ s_in,
 }
 
 //float to half
-__global__ void convertFloatToHalf(const float* __restrict__ src, __half* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
+__global__ void convertFloatToHalf(const float* __restrict__ src, cutlass::half_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -127,7 +131,7 @@ __global__ void floatToFp8E4M3Kernel(const float* __restrict__ src, uint8_t* __r
     }
 }
 
-__global__ void roundAndCastFp8(const float* __restrict__ src, const float* __restrict__ max_val, uint8_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
+__global__ void roundAndCastFp8(const float* __restrict__ src, const float* __restrict__ max_val, cutlass::float_e4m3_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -174,6 +178,36 @@ __global__ void extractDiagonal(const double* __restrict__ d_in,
     {
         int offset = i + i * ld;
         D[i] = d_in[offset];
+    }
+}
+
+
+///kerneel to update diagonal with O(nb) work 
+__global__ void update_diag(const float* __restrict__ diag_A, float* __restrict__ updated_diag, float* __restrict__ L_block, int n, int k, int ld)
+{
+    extern __shared__ float sfdata[];
+    
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    {
+        sfdata[i] = updated_diag[i];
+        for(int j = 0; k < k; j++)
+        {
+            sfdata[i] -= L_block[ld*i + j]*L_block[ld*j + i];
+        }
+
+        updated_diag[i] = sfdata[i];
+    }
+
+}
+// kernel to chek if I can switch prec
+__global__ void can_switch(const float* __restrict__ diag_A, float* __restrict__ updated_diag, float mach_eps, float eps_prime, int n, bool* to_ret)
+{
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    {
+        if(mach_eps*updated_diag[i] < eps_prime*diag_A[i]) {
+            *to_ret = false;
+            return;
+        }
     }
 }
 
@@ -261,105 +295,105 @@ __global__ void vanilla_Max(const double* __restrict__ vec, double* blockMax, in
     }
 }
 
-// __global__ void vanilla_Max(const float* __restrict__ vec, float* blockMax, int n)
-// {
-//     extern __shared__ float sdata[];
-//     int local_tid  = threadIdx.x;                             // Local index within the block
-//     int global_tid = blockIdx.x * blockDim.x + local_tid;      // Global index
-//     float t_val = 0.0;
+__global__ void vanilla_Max(const float* __restrict__ vec, float* blockMax, int n)
+{
+    extern __shared__ float sfdata[];
+    int local_tid  = threadIdx.x;                             // Local index within the block
+    int global_tid = blockIdx.x * blockDim.x + local_tid;      // Global index
+    float t_val = 0.0;
 
-//     for (int i = global_tid; i < n; i += blockDim.x * gridDim.x)
-//     {
-//         t_val = fmaxf(t_val, fabs(vec[i]));
-//     }
+    for (int i = global_tid; i < n; i += blockDim.x * gridDim.x)
+    {
+        t_val = fmaxf(t_val, fabs(vec[i]));
+    }
     
-//     // Store the thread's result in shared memory.
-//     sdata[local_tid] = t_val;
-//     __syncthreads();
+    // Store the thread's result in shared memory.
+    sfdata[local_tid] = t_val;
+    __syncthreads();
 
-//     // Intra-block reduction in shared memory.
-//     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-//         if (local_tid < s) {
-//             sdata[local_tid] = fmaxf(sdata[local_tid], sdata[local_tid + s]);
-//         }
-//         __syncthreads();
-//     }
+    // Intra-block reduction in shared memory.
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (local_tid < s) {
+            sfdata[local_tid] = fmaxf(sfdata[local_tid], sfdata[local_tid + s]);
+        }
+        __syncthreads();
+    }
 
-//     // Write the block's maximum to the output array.
-//     if (local_tid == 0) {
-//         blockMax[blockIdx.x] = sdata[0];
-//     }
-// }
+    // Write the block's maximum to the output array.
+    if (local_tid == 0) {
+        blockMax[blockIdx.x] = sfdata[0];
+    }
+}
 
 //the below func assumes matrix is stored in column major so we will transpose the 2D threads to make suree that we can still use memory coalescing and all that
-// __global__ void vanilla_Max_2D_col_major(const float* __restrict__ mat, float* blockMax, 
-//                                          int rows, int cols, int ld) {
-//     extern __shared__ float sdata[];
+__global__ void vanilla_Max_2D_col_major(const float* __restrict__ mat, float* blockMax, 
+                                         int rows, int cols, int ld) {
+    extern __shared__ float sfdata[];
 
-//     // Compute thread's unique (x, y) coordinates with transposed indexing
-//     int ty = threadIdx.x;  // Swap thread x <--> y
-//     int tx = threadIdx.y;
-//     int by = blockIdx.x;   // Swap block x <--> y
-//     int bx = blockIdx.y;
+    // Compute thread's unique (x, y) coordinates with transposed indexing
+    int ty = threadIdx.x;  // Swap thread x <--> y
+    int tx = threadIdx.y;
+    int by = blockIdx.x;   // Swap block x <--> y
+    int bx = blockIdx.y;
 
-//     int global_y = by * blockDim.x + ty;  // Now iterating over columns
-//     int global_x = bx * blockDim.y + tx;  // Now iterating over rows
+    int global_y = by * blockDim.x + ty;  // Now iterating over columns
+    int global_x = bx * blockDim.y + tx;  // Now iterating over rows
 
-//     int local_tid  = ty * blockDim.y + tx; // Flattened thread ID inside block
-//     float t_val = 0.0;
+    int local_tid  = ty * blockDim.y + tx; // Flattened thread ID inside block
+    float t_val = 0.0;
 
-//     // Strided access (column-major optimized)
-//     for (int x = global_x; x < rows; x += gridDim.y * blockDim.y) { // Iterate over rows first
-//         for (int y = global_y; y < cols; y += gridDim.x * blockDim.x) { // Iterate over columns next
-//             int idx = x + y * ld;  // Column-major indexing: (row + col * ld)
-//             t_val = fmaxf(t_val, fabs(mat[idx]));
-//         }
-//     }
+    // Strided access (column-major optimized)
+    for (int x = global_x; x < rows; x += gridDim.y * blockDim.y) { // Iterate over rows first
+        for (int y = global_y; y < cols; y += gridDim.x * blockDim.x) { // Iterate over columns next
+            int idx = x + y * ld;  // Column-major indexing: (row + col * ld)
+            t_val = fmaxf(t_val, fabs(mat[idx]));
+        }
+    }
 
-//     // Store thread's max value in shared memory
-//     sdata[local_tid] = t_val;
-//     __syncthreads();
+    // Store thread's max value in shared memory
+    sfdata[local_tid] = t_val;
+    __syncthreads();
 
-//     // Intra-block reduction in shared memory
-//     for (unsigned int s = (blockDim.x * blockDim.y) / 2; s > 0; s >>= 1) {
-//         if (local_tid < s) {
-//             sdata[local_tid] = fmaxf(sdata[local_tid], sdata[local_tid + s]);
-//         }
-//         __syncthreads();
-//     }
+    // Intra-block reduction in shared memory
+    for (unsigned int s = (blockDim.x * blockDim.y) / 2; s > 0; s >>= 1) {
+        if (local_tid < s) {
+            sfdata[local_tid] = fmaxf(sfdata[local_tid], sfdata[local_tid + s]);
+        }
+        __syncthreads();
+    }
 
-//     // Write block's max to global memory
-//     if (local_tid == 0) {
-//         int block_index = bx * gridDim.x + by; // Adjust block ID mapping
-//         blockMax[block_index] = sdata[0];
-//     }
-// }
+    // Write block's max to global memory
+    if (local_tid == 0) {
+        int block_index = bx * gridDim.x + by; // Adjust block ID mapping
+        blockMax[block_index] = sfdata[0];
+    }
+}
 
-// __global__ void final_max_reduce(const float* __restrict__ blockMax, float* max, int nBlocks)
-// {
-//     extern __shared__ float sdata[];
-//     int tid = threadIdx.x;
+__global__ void final_max_reduce(const float* __restrict__ blockMax, float* max, int nBlocks)
+{
+    extern __shared__ float sfdata[];
+    int tid = threadIdx.x;
 
-//     // Load the blockMax values into shared memory.
-//     // If the number of threads is greater than nBlocks, initialize extras with -DBL_MAX.
-//     if (tid < nBlocks)
-//         sdata[tid] = blockMax[tid];
-//     else
-//         sdata[tid] = 0.0;
-//     __syncthreads();
+    // Load the blockMax values into shared memory.
+    // If the number of threads is greater than nBlocks, initialize extras with -DBL_MAX.
+    if (tid < nBlocks)
+        sfdata[tid] = blockMax[tid];
+    else
+        sfdata[tid] = 0.0;
+    __syncthreads();
 
-//     // Reduction in shared memory.
-//     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-//         if (tid < s) {
-//             sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-//         }
-//         __syncthreads();
-//     }
+    // Reduction in shared memory.
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sfdata[tid] = fmaxf(sfdata[tid], sfdata[tid + s]);
+        }
+        __syncthreads();
+    }
 
-//     // Write the final maximum.
-//     if (tid == 0)
-//         *max = sdata[0];
-// }
+    // Write the final maximum.
+    if (tid == 0)
+        *max = sfdata[0];
+}
 
 
 

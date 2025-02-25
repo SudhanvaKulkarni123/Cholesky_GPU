@@ -8,12 +8,12 @@ TARGET = mixed_cholesky
 SRCS = mixed_cholesky.cu
 
 # Compilation flags (adjust as needed)
-CFLAGS = -arch=sm_89 -G -g -O3
+CFLAGS = -arch=sm_89 -std=c++20 -O3 -use_fast_math
 
 # Libraries to link
 LDFLAGS = -lcublas -lcusolver -lcurand -lcublasLt
 
-INCLUDE_PATH = -I$(HOME)/cutlass/include
+INCLUDE_PATH = -I$(HOME)/cutlass/include -I$(HOME)/LoFloat/tools
 
 # Default target
 all: $(TARGET)
