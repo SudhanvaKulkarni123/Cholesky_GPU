@@ -5,7 +5,11 @@
 #include <iostream>
 #include <cutlass/epilogue/thread/linear_combination_clamp.h>
 #include <json.hpp>
-#include "sChol.cuh"
+//#include "sChol.cuh"
+//#include "hChol.cuh"
+//#include "fp8Chol.cuh"
+#include "switching_chol.cuh"
+#include <mkl.h>
 
 
 using namespace std;
@@ -23,209 +27,11 @@ void host_isnan(float* A, int n)
 }
 
 
+// vanilla CG
+int vanilla_CG(double* A, double* x, double* b, int n, double normA)
+{
 
-
-// ///fp8 version of mixed Cholesky-
-int fp8_mixed_precision_Cholesky(float* d_A, int ld, int r,
-                                      float* diag_A, float* updated_diag,
-                                      cublasHandle_t handle, cudaStream_t stream,
-                                      int n) {
-    float one = 1.0f;
-    float negOne = -1.0f;
-
-    // Allocate half-precision buffer for A_sub
-    cutlass::float_e4m3_t* d_A_sub_fp8;
-    cudaMalloc((void**)&d_A_sub_fp8, sizeof(uint8_t) * n * n);
-
-    
-    int vecThreads = 256;
-    int vecBlocks = (n * n + vecThreads - 1) / vecThreads;
-
-    float* max_L = nullptr;
-    float h_max_L;
-    CUDA_CHECK(cudaMalloc((void**) &max_L, sizeof(float)));
-    float* dev_blockMax = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&dev_blockMax, vecBlocks * sizeof(float)));
-
-    // CUDA Events for Profiling
-    cudaEvent_t start, stop;
-    float time_factorize = 0, time_trsm = 0, time_conversion = 0, time_gemm = 0;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // Variables for FLOP counts
-    double flops_factorize = 0, flops_trsm = 0, flops_gemm = 0;
-    float alpha = -1.0f;
-    float beta = 1.0f;
-    float eps = 0.03125f;
-
-
-using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombination<
-    float,  
-    8
->;
-
-    //declare GEMM functor-
-      using GemmFp8Fp32 = cutlass::gemm::device::Gemm<
-            cutlass::float_e4m3_t,           // ElementA (FP8)
-            cutlass::layout::RowMajor,       // LayoutA
-            cutlass::float_e4m3_t,           // ElementB (FP8)
-            cutlass::layout::ColumnMajor,       // LayoutA^T
-            float,                           // ElementC (output)
-            cutlass::layout::RowMajor,       // LayoutC
-            float,                           // ElementAccumulator (accumulation type: FP32)
-            cutlass::arch::OpClassTensorOp,  // Operator class (Tensor Ops)
-            cutlass::arch::Sm89,             // Architecture (Sm89 for FP8 support)
-            cutlass::gemm::GemmShape<128, 64, 128>,  // Threadblock shape
-            cutlass::gemm::GemmShape<64, 32, 128>,   // Warp shape
-            cutlass::gemm::GemmShape<16, 8, 32>,     // Instruction shape
-            EpilogueOutputOp,                        // **Custom No-Op Epilogue**
-            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Threadblock swizzle
-            3,    // Number of stages
-            16,   // Alignment A
-            16   // Alignment B
-            // cutlass::arch::OpMultiplyAddFastAccum  // Operator
-        >;
-
-        GemmFp8Fp32 lo_gemm_op;
-
-float* A_00 = nullptr;
-    cudaHostAlloc((void**)&A_00, sizeof(float) * r * r, cudaHostAllocDefault);
-
-
-    for (int k = 0; k < n; k += r) {
-        int r_block = (k + r < n) ? r : (n - k);
-        // Start timing A00 factorization
-        cudaEventRecord(start, stream);
-
-        size_t dstPitch = r_block * sizeof(float);
-        size_t srcPitch = ld * sizeof(float);
-        size_t widthInBytes = r_block * sizeof(float);
-
-        CUDA_CHECK(cudaMemcpy2D(A_00, dstPitch,
-                                     d_A + k + k * ld, srcPitch, 
-                                     widthInBytes, r_block, 
-                                cudaMemcpyDeviceToHost));
-
-        // CPU Cholesky factorization
-        micro_cholesky(A_00, r_block, r_block);
-
-        int sub = n - (k + r_block);
-
-        CUDA_CHECK(cudaMemcpy2D(d_A + k + k * ld, srcPitch,
-                                     A_00, dstPitch, 
-                                     widthInBytes, r_block, 
-                                cudaMemcpyHostToDevice));
-
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        float elapsed;
-        cudaEventElapsedTime(&elapsed, start, stop);
-        time_factorize += elapsed;
-
-        // Calculate FLOPs for Cholesky Factorization
-        flops_factorize += (1.0 / 3.0) * r_block * r_block * r_block;
-
-        if (sub > 0) {
-            // Start timing TRSM
-            cudaEventRecord(start, stream);
-
-            // CUBLAS_CHECK(
-            //     cublasStrsm(
-            //         handle,
-            //         CUBLAS_SIDE_RIGHT,
-            //         CUBLAS_FILL_MODE_LOWER,
-            //         CUBLAS_OP_T,
-            //         CUBLAS_DIAG_NON_UNIT,
-            //         sub, r_block, &one,
-            //         d_A + k + k * ld, ld,
-            //         d_A + (k + r_block) + k * ld, ld
-            //     )
-            // );
-
-            cudaEventRecord(stop, stream);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&elapsed, start, stop);
-            time_trsm += elapsed;
-
-            // Calculate FLOPs for TRSM
-            flops_trsm += r_block * r_block * sub;
-
-            // Start timing conversion
-            cudaEventRecord(start, stream);
-  
-
-            //  vanilla_Max_2D_col_major<<<vecBlocks, vecThreads, vecThreads * sizeof(double), stream>>>(
-            //     d_A + (k + r_block) + k * ld, dev_blockMax, r_block, sub, n);
-            // int finalThreads = 256;
-            // final_max_reduce<<<1, finalThreads, finalThreads * sizeof(double), stream>>>(
-            //     dev_blockMax, max_L, vecBlocks);
-            dim3 blockSize(16, 16);
-            dim3 gridSize((sub + blockSize.x - 1) / blockSize.x, (r_block + blockSize.y - 1) / blockSize.y);
-            roundAndCastFp8<<<gridSize, blockSize, 0, stream>>>(
-                d_A + (k + r_block) + k * ld, &one, 
-                d_A_sub_fp8,
-                sub, r_block, ld, ld);
-            cudaStreamSynchronize(stream);
-
-
-            cudaEventRecord(stop, stream);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&elapsed, start, stop);
-            time_conversion += elapsed;
-
-            //now compute GEMM with CUTLASS
-                // Now, define the GEMM operator using these tuning parameters.
-      
-        // Set up arguments for the CUTLASS FP8 GEMM
-
-    
-        float to_put = alpha;
-
-        typename GemmFp8Fp32::Arguments fp8_arguments{
-            {sub, sub, r_block},                    // GEMM problem size
-            {d_A_sub_fp8, ld},            // Tensor A: pointer and leading dimension M
-            {d_A_sub_fp8, ld},            // Tensor B: pointer and leading dimension K
-            {d_A + k + r_block + (k+r_block)*ld, ld},       // Tensor C: pointer and leading dimension M (input/output)
-            {d_A + k + r_block + (k+r_block)*ld, ld},       // Tensor D: pointer and leading dimension M (output)
-            {to_put, beta}                 // Epilogue parameters
-        };
-
-
-        cudaEventRecord(start, stream);
-        cutlass::Status status = lo_gemm_op(fp8_arguments);
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&elapsed, start, stop);
-        time_gemm += elapsed;
-
-                }
-            }
-
-    // Free resources
-    cudaFreeHost(A_00);
-    cudaFree(d_A_sub_fp8);
-    cudaFree(max_L);
-    cudaFree(dev_blockMax);
-
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    // Print profiling results
-    std::cout << "Profiling Results (ms) & FLOPs:\n";
-    std::cout << "Factorization (A00): " << time_factorize << " ms, "
-              << "FLOPs: " << flops_factorize / 1e9 << " GFLOPs\n";
-    std::cout << "TRSM: " << time_trsm << " ms, "
-              << "FLOPs: " << flops_trsm / 1e9 << " GFLOPs\n";
-    std::cout << "Conversion (Float -> Half): " << time_conversion << " ms\n";
-    std::cout << "GEMM: " << time_gemm << " ms, "
-              << "FLOPs: " << flops_gemm / 1e9 << " GFLOPs\n";
-
-    return 0;
 }
-
-
 
 
 // Preconditioned Conjugate Gradient (CG) solver (simplified skeleton)
@@ -235,8 +41,10 @@ float* A_00 = nullptr;
 // precond_CG function
 //-----------------------------
 int precond_CG(double* A, double* x,
-               double* b, int n, int r, double normA) {
+               double* b, int n, int r, double normA, float eps_prime = 0.0f, float flr = 0.0f) {
 
+
+    
     std::ofstream myfile("e5m2_error_f_cond.csv");
     cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
@@ -271,6 +79,7 @@ int precond_CG(double* A, double* x,
 // Compute total memory required
 size_t size_A_d = n * n * sizeof(double);
 size_t size_A_f = n * n * sizeof(float);
+size_t max_buff_size = n * r * sizeof(float);  // Matul buffer size
 size_t vec_size = n * sizeof(double);
 size_t half_vec_size = n * sizeof(float);  // For float vectors
 size_t scal_size = sizeof(double);
@@ -279,29 +88,31 @@ size_t perm_size = n * sizeof(int);
 
 
 // Total size to allocate in a single call
+size_t workspace_size = n * n * sizeof(float);  // New workspace buffer
+
 size_t total_size = 
     size_A_d +  // d_A
     size_A_f +  // s_A
+    workspace_size + // New workspace buffer
     size_A_d +  // LL_copy
     7 * vec_size +  // dev_x, dev_b, dev_r, p, Ap, dev_z, dev_D (all double)
     2 * half_vec_size +  // diag_A, updated_diag (float)
     4 * scal_size +  // pAp, rz, rz_new, inf_norm_r (double)
     3 * scal_size +  // d_One, d_Zero, d_NegOne (double)
-    2 * perm_size;  // dev_left_perm, dev_right_perm (int), can maybe add the lw precision buffer here as well
-
+    2 * perm_size + sizeof(int);  // dev_left_perm, dev_right_perm (int)
 
 // Allocate memory
 void* d_mem = nullptr;
 CUDA_CHECK(cudaMalloc(&d_mem, total_size));
 
-// Assign pointers based on offsets
 char* d_mem_char = reinterpret_cast<char*>(d_mem);
 
 double* d_A        = reinterpret_cast<double*>(d_mem_char);
-float* s_A         = reinterpret_cast<float*>(d_mem_char + size_A_d);
-double* LL_copy    = reinterpret_cast<double*>(d_mem_char + size_A_d + size_A_f);
+double* LL_copy    = reinterpret_cast<double*>(d_mem_char + size_A_d);  // LL_copy right after d_A
+float* s_A         = reinterpret_cast<float*>(d_mem_char + size_A_d + size_A_d);
+float* workspace   = reinterpret_cast<float*>(d_mem_char + size_A_d + size_A_d + size_A_f);  // Workspace right after s_A
 
-double* dev_x      = reinterpret_cast<double*>(d_mem_char + size_A_d + size_A_f + size_A_d);
+double* dev_x      = reinterpret_cast<double*>(d_mem_char + size_A_d + size_A_d + size_A_f + workspace_size);
 double* dev_b      = dev_x + n;
 double* dev_r      = dev_b + n;
 double* p          = dev_r + n;
@@ -309,7 +120,7 @@ double* Ap         = p + n;
 double* dev_z      = Ap + n;
 double* dev_D      = dev_z + n;
 
-float* diag_A      = reinterpret_cast<float*>(dev_D + n);
+float* diag_A      = reinterpret_cast<float*>(dev_D + n);  
 float* updated_diag= diag_A + n;
 
 double* pAp        = reinterpret_cast<double*>(updated_diag + n);
@@ -323,6 +134,8 @@ double* d_NegOne   = d_Zero + 1;
 
 int* dev_left_perm  = reinterpret_cast<int*>(d_NegOne + 1);
 int* dev_right_perm = dev_left_perm + n;
+int* devInfo = dev_right_perm + n;
+
 
 // Copy scalar values asynchronously
 CUDA_CHECK(cudaMemcpyAsync(d_One,    &One,    scal_size, cudaMemcpyHostToDevice, stream));
@@ -386,9 +199,14 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
 
     CUDA_CHECK(cudaEventRecord(start, stream));
     CUDA_CHECK(cudaDeviceSynchronize());
+    //uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
     //uniform_prec_fused_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
-    uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
+    //uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
     //uniform_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, stream, n);
+   // halfprec_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::half_t*>(workspace));
+    //fp8_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::float_e4m3_t*>(workspace), flr);
+
+    switching_precision_Cholesky(s_A, n, r, workspace, diag_A, updated_diag, handle, CuHandle_t, stream, n, eps_prime, flr);
     CUDA_CHECK(cudaStreamSynchronize(stream));
       CUDA_CHECK(cudaEventRecord(stop, stream));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -451,10 +269,8 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
     // Solve L y = b then L^T x = y; use p as temp
     float time_init_soln;
     cudaEventRecord(start, stream);
-    CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, p, 1));
-    CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, p, 1));
+    CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
+
     cudaEventRecord(stop, stream);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_init_soln, start, stop);
@@ -466,7 +282,7 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
 
     // r = b - A*x
     CUBLAS_CHECK(cublasDgemv(handle, CUBLAS_OP_N, n, n, d_NegOne,
-                             d_A, n, dev_x, 1, d_One, dev_b, 1));
+                             d_A, n, dev_x, 1, d_One, dev_b, 1));           //doesnt matter if its row or col major
     CUDA_CHECK(cudaMemcpy(dev_r, dev_b, vec_size, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -505,10 +321,8 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
     // Compute r^T z
     cudaEventRecord(start, stream);
     CUDA_CHECK(cudaMemcpy(dev_z, dev_r, vec_size, cudaMemcpyDeviceToDevice));
-    CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, dev_z, 1));
-    CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, dev_z, 1));
+    CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
+
 
     CUBLAS_CHECK(cublasDdot(handle, n, dev_z, 1, dev_r, 1, rz));
 
@@ -531,7 +345,7 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
         // Ap = A * p
         cudaEventRecord(start, stream);
         CUBLAS_CHECK(cublasDgemv(handle, CUBLAS_OP_N, n, n,
-                                 d_One, d_A, n, p, 1, d_Zero, Ap, 1));
+                                 d_One, d_A, n, p, 1, d_Zero, Ap, 1));          //doesnt matter if its row or col major
         
         CUBLAS_CHECK(cublasDdot(handle, n, Ap, 1, p, 1, pAp));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -576,10 +390,7 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         cudaEventRecord(start, stream);
-        CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, dev_z, 1));
-        CUBLAS_CHECK(cublasDtrsv(handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                             CUBLAS_DIAG_NON_UNIT, n, LL_copy, n, dev_z, 1));
+        CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
         cudaEventRecord(stop, stream);
         cudaEventSynchronize(stop);
         float elapsed_time2;
@@ -691,13 +502,60 @@ int solveWithCuSolver(double* A, double* x, const double* b, int n) {
 }
 
 
+// Solve A*x = b using Intel MKL's Cholesky factorization.
+int solveWithMKL(double* A, double* x, const double* b, int n) {
+    // Copy b to x since LAPACK overwrites b with the solution.
+    memcpy(x, b, n * sizeof(double));
+
+    // Perform Cholesky factorization (A = L * L^T)
+    int info = LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', n, A, n);
+    if (info != 0) {
+        printf("MKL Cholesky factorization failed with info = %d\n", info);
+        exit(EXIT_FAILURE);
+    }
+
+    // Solve A*x = b using the factorized matrix
+    info = LAPACKE_dpotrs(LAPACK_COL_MAJOR, 'L', n, 1, A, n, x, n);
+    if (info != 0) {
+        printf("MKL Cholesky solve failed with info = %d\n", info);
+        exit(EXIT_FAILURE);
+    }
+
+    return 0;
+}
+
+
+
 //---------------------------------------------------------------------
 // Main function: setup dummy problem and run preconditioned CG.
 int main(int argc, char* argv[]) {
         // Create cuSOLVER / cuBLAS handles and stream
+
+        int deviceCount;
+        cudaGetDeviceCount(&deviceCount);
+        std::cout << "CUDA devices available: " << deviceCount << std::endl;
+        
+        if (deviceCount == 0) {
+            std::cerr << "No CUDA devices found! Exiting...\n";
+            exit(EXIT_FAILURE);
+        }
+        
+        // Try selecting device 0 explicitly
+        int device = 0;
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            std::cerr << "Failed to set CUDA device 0: " << cudaGetErrorString(err) << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        cudaDeviceSynchronize();
+        std::cout << "Using CUDA device: " << device << std::endl;
+        
+        
     cusolverDnHandle_t cusolverH = nullptr;
     cublasHandle_t cublasH = nullptr;
     cudaStream_t stream = nullptr;
+
 
     CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
     CUBLAS_CHECK(cublasCreate(&cublasH));
@@ -722,10 +580,11 @@ int main(int argc, char* argv[]) {
     int r = stoi(tmp);
     tmp = fact_set["eps_prime"].dump();
     tmp = tmp.substr(1, tmp.size() - 2);
-    float eps_preim = stof(tmp);
+    float eps_prime = stof(tmp);
     tmp = fact_set["floor"].dump();
     tmp = tmp.substr(1, tmp.size() - 2);
     float flr = stof(tmp);
+    
 
 
 
@@ -773,7 +632,7 @@ int main(int argc, char* argv[]) {
     // ----------------------------
     // Run our custom solver.
     CUDA_CHECK(cudaEventRecord(start));
-    int cg_iters = precond_CG(A, x_our, b, n, r, inf_norm);
+    int cg_iters = precond_CG(A, x_our, b, n, r, inf_norm, eps_prime, flr);
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     float time_our = 0.0f;
@@ -789,6 +648,18 @@ int main(int argc, char* argv[]) {
     float time_cusolver = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&time_cusolver, start, stop));
     printf("cuSOLVER completed in %.2f ms.\n", time_cusolver);
+
+    // ----------------------------
+    // Run MKL's solver.
+    printf("Running MKL solver...\n");
+    CUDA_CHECK(cudaEventRecord(start));
+    solveWithMKL(A, x_cusolver, b, n);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float time_mkl = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&time_mkl, start, stop));
+    printf("MKL completed in %.2f ms.\n", time_mkl);
+
 
     // Compute residual of our solver: r_our = b - A*x_our
     double r_our_norm = 0.0;
@@ -823,15 +694,19 @@ int main(int argc, char* argv[]) {
     
     // ----------------------------
     // Compare the solutions (compute relative L2 norm difference).
-    double diff_norm = 0.0, sol_norm = 0.0;
+    double diff_norm = 0.0, sol_norm = 0.0, x_max = 0.0, x_nrm = 0.0;
     for (int i = 0; i < n; i++) {
         double diff = x_our[i] - x_cusolver[i];
         diff_norm += diff * diff;
         sol_norm  += x_cusolver[i] * x_cusolver[i];
+        x_nrm += x_cusolver[i]*x_cusolver[i];
+        x_max = max(x_max, abs(x_cusolver[i]));
     }
     diff_norm = sqrt(diff_norm);
     sol_norm = sqrt(sol_norm);
-    printf("norm difference between our solver and cuSOLVER: %e\n", diff_norm );
+    x_nrm = sqrt(x_nrm);
+    printf("norm difference between our solver and cuSOLVER: %e\n", diff_norm/x_nrm );
+    printf("inf norm of x is : %e\n", x_max);
     
     // Clean up CUDA events.
     CUDA_CHECK(cudaEventDestroy(start));

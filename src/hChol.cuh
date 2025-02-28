@@ -1,14 +1,16 @@
 int halfprec_mixed_precision_Cholesky(float* d_A, int ld, int r,
     float* diag_A, float* updated_diag,
-    cublasHandle_t handle, cudaStream_t stream,
-    int n) {
+    cublasHandle_t handle,  cusolverDnHandle_t cusolverH, cudaStream_t stream,
+    int n, cutlass::half_t* d_A_sub_half) {
 float one = 1.0f;
 float negOne = -1.0f;
 
+int devInfo_h = 0;
+int* devInfo  = nullptr;
+CUDA_CHECK( cudaMalloc((void**)&devInfo, sizeof(int)) );
 
-
-float* A_00 = nullptr;
-cudaHostAlloc((void**)&A_00, sizeof(float) * r * r, cudaHostAllocDefault);
+// float* A_00 = nullptr;
+// cudaHostAlloc((void**)&A_00, sizeof(float) * r * r, cudaHostAllocDefault);
 int vecThreads = 256;
 int vecBlocks = (n * n + vecThreads - 1) / vecThreads;
 
@@ -46,9 +48,24 @@ float                       // Epilogue scalar type
 >;
 GemmFp16Fp32 lo_gemm_op;
 
+int lwork = 0;
+CUSOLVER_CHECK(
+    cusolverDnSpotrf_bufferSize(
+        cusolverH,
+        CUBLAS_FILL_MODE_LOWER, // We'll store the factor in the "upper" part for row-major
+        r,                      // max block size
+        d_A,                    // just pass a valid device pointer
+        ld,
+        &lwork
+    )
+);
+
+// Allocate workspace for the panel factorization
+float* panel_workspace = nullptr;
+CUDA_CHECK(cudaMalloc((void**)&panel_workspace, sizeof(float)*lwork));
+
 // Allocate half-precision buffer for A_sub
-cutlass::half_t* d_A_sub_half = nullptr;
-cudaMalloc((void**)&d_A_sub_half, sizeof(__half) * n * n);
+
 
 for (int k = 0; k < n; k += r) {
 int r_block = (k + r < n) ? r : (n - k);
@@ -60,20 +77,37 @@ size_t srcPitch = ld * sizeof(float);
 size_t widthInBytes = r_block * sizeof(float);
 
 
-CUDA_CHECK(cudaMemcpy2D(A_00, dstPitch,
-   d_A + k + k * ld, srcPitch, 
-   widthInBytes, r_block, 
-cudaMemcpyDeviceToHost));
+// CUDA_CHECK(cudaMemcpy2D(A_00, dstPitch,
+//    d_A + k + k * ld, srcPitch, 
+//    widthInBytes, r_block, 
+// cudaMemcpyDeviceToHost));
 
-// CPU Cholesky factorization
-micro_cholesky(A_00, r_block, r_block);
+// // CPU Cholesky factorization
+// micro_cholesky(A_00, r_block, r_block);
 
 int sub = n - (k + r_block);
 
-CUDA_CHECK(cudaMemcpy2D(d_A + k + k * ld, srcPitch,
-   A_00, dstPitch, 
-   widthInBytes, r_block, 
-cudaMemcpyHostToDevice));
+// CUDA_CHECK(cudaMemcpy2D(d_A + k + k * ld, srcPitch,
+//    A_00, dstPitch, 
+//    widthInBytes, r_block, 
+// cudaMemcpyHostToDevice));
+
+//factorizer on GPU 
+float* d_panel = d_A + (k * ld + k);
+CUSOLVER_CHECK(
+   cusolverDnSpotrf(
+       cusolverH,
+       CUBLAS_FILL_MODE_LOWER,  // store factor in 'upper' for row-major
+       r_block,
+       d_panel,
+       ld,
+       panel_workspace,
+       lwork,
+       devInfo
+   )
+);
+
+
 
 cudaEventRecord(stop, stream);
 cudaEventSynchronize(stop);
@@ -117,7 +151,6 @@ cudaEventRecord(start, stream);
 //     d_A + (k + r_block) + k * ld, dev_blockMax, r_block, sub, n);
 // int finalThreads = 256;
 // final_max_reduce<<<1, finalThreads, finalThreads * sizeof(double), stream>>>(
-//     dev_blockMax, max_L, vecBlocks);
 dim3 blockSize(16, 16);
 dim3 gridSize((sub + blockSize.x - 1) / blockSize.x, (r_block + blockSize.y - 1) / blockSize.y);
 convertFloatToHalf<<<gridSize, blockSize, 0, stream>>>(
@@ -163,9 +196,8 @@ time_gemm += elapsed;
 }
 
 // Free resources
-cudaFreeHost(A_00);
+
 cudaFree(d_A_sub_half);
-cudaFree(max_L);
 cudaFree(dev_blockMax);
 
 

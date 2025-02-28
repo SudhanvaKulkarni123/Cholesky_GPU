@@ -95,6 +95,28 @@ __global__ void convertDoubleToFloat(const double* __restrict__ d_in,
     }
 }
 
+// Atomic function for floating-point max
+__device__ void atomicMaxFloat(float* addr, float val) {
+    int* addr_as_int = (int*)addr;
+    int old = *addr_as_int, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(addr_as_int, assumed, __float_as_int(fmaxf(__int_as_float(assumed), val)));
+    } while (assumed != old);
+}
+
+
+
+__global__ void fixDiag(float* d_A, int n, float eps)
+{
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+    {
+        atomicMaxFloat(&d_A[i*n + i], fabsf(d_A[i*n + i]));
+        atomicMaxFloat(&d_A[i*n + i], eps);
+
+    }
+}
+
 //Convert Single to double
 __global__ void convertFloattoDouble(const float* __restrict__ s_in, 
                                         double* __restrict__ d_out,
@@ -154,6 +176,46 @@ __global__ void roundAndCastFp8(const float* __restrict__ src, const float* __re
     }
 }
 
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+
+
+
+
+
+
+__global__ void transposeScaleCastFp8(
+    const float* __restrict__ src,   // Input FP32 matrix
+    const float* __restrict__ max_val, // Max value for scaling
+    cutlass::float_e4m3_t* __restrict__ dst, // Output FP8 matrix
+    int rows, int cols, int ld_src, int ld_dst) 
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    for (; col < cols; col += gridDim.y * blockDim.y) {
+    float inv_max;
+    float scaled_val;
+
+        // Compute reciprocal of max_val using hardware reciprocal approximation
+    asm volatile ("rcp.approx.f32 %0, %1;" : "=f"(inv_max) : "f"(*max_val));
+
+    for (; row < rows; row += gridDim.x * blockDim.x) {
+
+            // Multiply instead of dividing (more efficient)
+            scaled_val = src[row + col*ld_src] * inv_max;
+
+            // Transpose and convert FP32 -> FP8 (E4M3)
+            dst[col + row*ld_dst] = float_to_fp8(scaled_val);
+        }
+    }
+}
+
+
 __global__ void floatToFp8E5M2Kernel(const float* __restrict__ src, uint8_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
@@ -185,32 +247,33 @@ __global__ void extractDiagonal(const double* __restrict__ d_in,
 ///kerneel to update diagonal with O(nb) work 
 __global__ void update_diag(const float* __restrict__ diag_A, float* __restrict__ updated_diag, float* __restrict__ L_block, int n, int k, int ld)
 {
-    extern __shared__ float sfdata[];
     
     for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     {
-        sfdata[i] = updated_diag[i];
-        for(int j = 0; k < k; j++)
+
+        for(int j = 0; j < k; j++)
         {
-            sfdata[i] -= L_block[ld*i + j]*L_block[ld*j + i];
+            updated_diag[i] -= L_block[ld*j + i]*L_block[ld*j + i];
         }
 
-        updated_diag[i] = sfdata[i];
     }
 
 }
-// kernel to chek if I can switch prec
-__global__ void can_switch(const float* __restrict__ diag_A, float* __restrict__ updated_diag, float mach_eps, float eps_prime, int n, bool* to_ret)
+__global__ void can_switch(const float* __restrict__ diag_A, 
+    float* __restrict__ updated_diag, 
+    float mach_eps, float eps_prime, int n, 
+    int* to_ret)  // ✅ Store as int for atomic operations
 {
-    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-    {
-        if(mach_eps*updated_diag[i] < eps_prime*diag_A[i]) {
-            *to_ret = false;
-            return;
-        }
-    }
+int i = blockIdx.x * blockDim.x + threadIdx.x;
+while (i < n)  
+{
+if (mach_eps * updated_diag[i] >= eps_prime * diag_A[i]) {
+atomicExch(to_ret, 0);  // ✅ Atomically set to false (0)
+return;
 }
-
+i += gridDim.x * blockDim.x;  
+}
+}
 // Normalize a matrix by dividing each column by its diagonal element.
 // The matrix is assumed to be stored in column-major order.
 __global__ void normalizeMatrix(double* __restrict__ d_in,
@@ -265,7 +328,7 @@ __device__ double atomicMaxDouble(double* address, double val) {
     return __longlong_as_double(old);
 }
 
-__global__ void vanilla_Max(const double* __restrict__ vec, double* blockMax, int n)
+__global__ void vanilla_Max(const double* __restrict__ vec, double* blockMax, int n)        //default args are only used for submatrix max norm
 {
     extern __shared__ double sdata[];
     int local_tid  = threadIdx.x;                             // Local index within the block
@@ -294,6 +357,7 @@ __global__ void vanilla_Max(const double* __restrict__ vec, double* blockMax, in
         blockMax[blockIdx.x] = sdata[0];
     }
 }
+
 
 __global__ void vanilla_Max(const float* __restrict__ vec, float* blockMax, int n)
 {
