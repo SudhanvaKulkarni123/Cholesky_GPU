@@ -1,3 +1,11 @@
+performing 15360 by 1024size SYRK in fp32
+performing 14336 by 1024size SYRK in fp32
+performing 13312 by 1024size SYRK in fp32
+performing 12288 by 1024size SYRK in fp32
+performing 11264 by 1024size SYRK in fp32
+performing 10240 by 1024size SYRK in fp32
+performing 9216 by 1024size SYRK in fp32
+performing 8192 by 1024size SYRK in fp32
 performing 7168 by 1024size SYRK in fp32
 performing 6144 by 1024size SYRK in fp32
 performing 5120 by 1024size SYRK in fp32

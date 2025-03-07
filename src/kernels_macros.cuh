@@ -18,6 +18,7 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/numeric_conversion.h>
+#include <cub/cub.cuh>
 
 namespace cg = cooperative_groups;
 
@@ -81,6 +82,32 @@ __device__ cutlass::float_e4m3_t float_to_fp8(float val) {
     return converter(val);
 }
 
+
+__device__ float fp8_to_float(cutlass::float_e4m3_t val, int8_t x) {
+    cutlass::NumericConverter<float, cutlass::float_e4m3_t> converter;
+    return pow(2.0f, x)*converter(val);
+}
+
+__device__ float fp8_to_float(cutlass::float_e4m3_t val, float x) {
+    cutlass::NumericConverter<float, cutlass::float_e4m3_t> converter;
+    return x*converter(val);
+
+}
+
+__device__ int closest_power_of_two(float x) {
+    int exponent;
+    frexpf(x, &exponent);  // Extract exponent from x = m * 2^e
+    int lower = 1 << (exponent - 1);  // 2^(e-1)
+    int upper = 1 << exponent;        // 2^e
+    return (upper - x < x - lower) ? upper : lower;
+}
+
+// __device__ cutlass::float_e4m3_t float_to_mxfp8(float x, int pwr) {
+//     float scaled_x = x/powf(2.0f, pwr);  // Scale by 2^pwr
+//     return cutlass::float_e4m3_t(scaled_x); // Con
+
+// }
+
 //---------------------------------------------------------------------
 // CUDA Kernels
 
@@ -106,16 +133,17 @@ __device__ void atomicMaxFloat(float* addr, float val) {
 }
 
 
-
-__global__ void fixDiag(float* d_A, int n, float eps)
+template< typename T>
+__global__ void fixDiag(T* d_A, int n, float eps)
 {
     for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
     {
-        atomicMaxFloat(&d_A[i*n + i], fabsf(d_A[i*n + i]));
+        atomicMaxFloat(&d_A[i*n + i], abs(d_A[i*n + i]));
         atomicMaxFloat(&d_A[i*n + i], eps);
 
     }
 }
+
 
 //Convert Single to double
 __global__ void convertFloattoDouble(const float* __restrict__ s_in, 
@@ -128,6 +156,39 @@ __global__ void convertFloattoDouble(const float* __restrict__ s_in,
     }
 
 }
+
+//find MAX with BlockReduce
+// __global__ void blockMaxReduce(const float* __restrict__ d_in, float* d_out, int num_items) {
+
+//     using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+//     __shared__ typename BlockReduce::TempStorage temp_storage;
+
+//     int tid = threadIdx.x + blockIdx.x * blockDim.x;
+//     float val = (tid < num_items) ? d_in[tid] : -FLT_MAX;
+
+//     // Perform block-wide max reduction
+//     float block_max = BlockReduce(temp_storage).Reduce(val, cub::Max());
+
+//     // Store max from each block in global memory
+//     if (threadIdx.x == 0) {
+//         d_out[blockIdx.x] = floor(log2(block_max));
+//     }
+// }
+
+// __global__ void floatToMX8(const float* __restrict__ src, cutlass::float_e4m3_t* __restrict__ dst, int* __restrict__ dst_pow, int rows, int cols, int ld_src, int ld_dst)
+// {
+//     int row = blockIdx.x * blockDim.x + threadIdx.x;
+//     int col = blockIdx.y * blockDim.y + threadIdx.y;
+
+//     blockMaxReduce(src, ,blockDim.x);
+//     for (; row < rows; row += gridDim.x * blockDim.x) {
+//         for (; col < cols; col += gridDim.y * blockDim.y) {
+//             dst[row + col * ld_dst] = __float2half(src[row + col * ld_src]);
+//         }
+//     }
+
+
+// }
 
 //float to half
 __global__ void convertFloatToHalf(const float* __restrict__ src, cutlass::half_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
@@ -176,6 +237,87 @@ __global__ void roundAndCastFp8(const float* __restrict__ src, const float* __re
     }
 }
 
+//src pow is the MX scaling
+template<typename scaling_type>
+__global__ void Fp8toFloat(const cutlass::float_e4m3_t* __restrict__ src, const scaling_type* __restrict__ src_pow, const float* __restrict__ dst, int rows, int cols, int ld, int r)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x + threadIdx.y * blockIdx.x;
+
+    for (; row < rows; row += gridDim.x * blockDim.x) {
+        for (; col < cols; col += gridDim.y * blockDim.y) {
+            int index = (row) + (col) * ld;
+            int scal_index = row/r + (col/r)*ld;
+            
+            // Store result in output array
+            dst[index] = fp8_to_float(src[index], src_pow[scal_index]);
+        }
+    }
+
+}
+
+__global__ void FloatToMXFP8(const float* __restrict__ src, int8_t* __restrict__ dst_pow, cutlass::float_e4m3_t* __restrict__ dst, int rows, int cols, int ld, int r)
+{
+    extern __shared__ float sfdata[];
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x + threadIdx.y * blockDim.x; // Correct tid computation
+
+    // Ensure within bounds
+    if (row >= rows || col >= cols) return;
+
+    // Compute index for column-major layout
+    int index = row + col * ld;
+    int block_row = (row / r) * r;
+    int block_col = (col / r) * r;
+    
+    int scal_index = (block_row / r) + (block_col / r) * (ld / r); // Scaling factor index
+
+    // Load data into shared memory for reduction
+    sfdata[tid] = (row < rows && col < cols) ? fabsf(src[index]) : 0;
+    __syncthreads();
+
+    // 1D Max Reduction (Parallel Reduction in Shared Memory)
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sfdata[tid] = fmaxf(fabsf(sfdata[tid + s]), fabsf(sfdata[tid]));
+        }
+        __syncthreads();
+    }
+
+    // Store the max value for the r-by-r block
+    if (tid == 0) dst_pow[scal_index] = sfdata[0];
+
+    __syncthreads();  
+
+    // divide by max and Convert to FP8
+    float scale = sfdata[0];  // Max value for this r-by-r block
+
+    for (int r_offset = 0; r_offset < r; r_offset++) {
+        for (int c_offset = 0; c_offset < r; c_offset++) {
+            int new_row = block_row + r_offset;
+            int new_col = block_col + c_offset;
+
+            if (new_row < rows && new_col < cols) {
+                int new_index = new_row + new_col * ld;  // Column-major index
+                float inv_max;
+                asm volatile ("rcp.approx.f32 %0, %1;" : "=f"(inv_max) : "f"(scale));
+                auto scaled_val = src[new_index] * inv_max;
+
+                // Convert FP32 -> FP8 (E4M3) using PTX
+                dst[new_index] = float_to_fp8(scaled_val); 
+                
+            }
+        }
+    }
+
+    
+}
+
+
+
+//need to call cub for 32*32 blocks. Find max of each and then use warp reduce
 __device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
@@ -264,15 +406,15 @@ __global__ void can_switch(const float* __restrict__ diag_A,
     float mach_eps, float eps_prime, int n, 
     int* to_ret)  // ✅ Store as int for atomic operations
 {
-int i = blockIdx.x * blockDim.x + threadIdx.x;
-while (i < n)  
-{
-if (mach_eps * updated_diag[i] >= eps_prime * diag_A[i]) {
-atomicExch(to_ret, 0);  // ✅ Atomically set to false (0)
-return;
-}
-i += gridDim.x * blockDim.x;  
-}
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        while (i < n)  
+        {
+            if (mach_eps * updated_diag[i] >= eps_prime * diag_A[i]) {
+            atomicExch(to_ret, 0);  // ✅ Atomically set to false (0)
+            return;
+            }
+        i += gridDim.x * blockDim.x;  
+        }
 }
 // Normalize a matrix by dividing each column by its diagonal element.
 // The matrix is assumed to be stored in column-major order.

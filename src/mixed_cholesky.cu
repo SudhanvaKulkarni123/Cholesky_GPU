@@ -12,7 +12,40 @@
 #include <mkl.h>
 
 
-using namespace std;
+
+
+int selectBestGPU() {
+    int num_devices;
+    cudaGetDeviceCount(&num_devices);
+
+    if (num_devices == 0) {
+        std::cerr << "No CUDA devices found!" << std::endl;
+        return -1;
+    }
+
+    size_t max_free_mem = 0;
+    int best_device = 0;
+
+    for (int i = 0; i < num_devices; i++) {
+        cudaSetDevice(i);
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+
+        std::cout << "GPU " << i << ": Free = " 
+                  << free_mem / (1024 * 1024) << " MB, Total = " 
+                  << total_mem / (1024 * 1024) << " MB\n";
+
+        if (free_mem > max_free_mem) {
+            max_free_mem = free_mem;
+            best_device = i;
+        }
+    }
+
+    std::cout << "Selecting GPU " << best_device << " with max free memory: " 
+              << max_free_mem / (1024 * 1024) << " MB\n";
+
+    return best_device;
+}
 
 enum distr_type : uint8_t {
     Arith, Geom, Rand
@@ -41,7 +74,7 @@ int vanilla_CG(double* A, double* x, double* b, int n, double normA)
 // precond_CG function
 //-----------------------------
 int precond_CG(double* A, double* x,
-               double* b, int n, int r, double normA, float eps_prime = 0.0f, float flr = 0.0f) {
+               double* b, int n, int r, double normA, float eps_prime = 0.0f, float flr = 0.0f, bool perturb_diab = false, bool left_looking = false) {
 
 
     
@@ -203,7 +236,7 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
     //uniform_prec_fused_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
     //uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
     //uniform_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, stream, n);
-   // halfprec_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::half_t*>(workspace));
+     //halfprec_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::half_t*>(workspace));
     //fp8_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::float_e4m3_t*>(workspace), flr);
 
     switching_precision_Cholesky(s_A, n, r, workspace, diag_A, updated_diag, handle, CuHandle_t, stream, n, eps_prime, flr);
@@ -446,6 +479,71 @@ CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stre
     return count;
     } // End CG loop.
 
+
+    int vanilla_CG(double* d_A, double* d_x, double* d_b, int n, double tol = 1e-6, int max_iter = 1000) {
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+    
+        // Allocate GPU memory
+        double *d_r, *d_p, *d_Ap;
+        cudaMalloc((void**)&d_r, n * sizeof(double));
+        cudaMalloc((void**)&d_p, n * sizeof(double));
+        cudaMalloc((void**)&d_Ap, n * sizeof(double));
+    
+        double alpha, beta, r_dot, r_dot_new, pAp;
+        double neg_one = -1.0, one = 1.0, zero = 0.0;
+    
+        // Initialize r = b - Ax
+        cublasDgemv(handle, CUBLAS_OP_N, n, n, &one, d_A, n, d_x, 1, &zero, d_r, 1);
+        cublasDaxpy(handle, n, &neg_one, d_r, 1, d_b, 1);  // r = b - Ax
+        cudaMemcpy(d_p, d_r, n * sizeof(double), cudaMemcpyDeviceToDevice); // p = r
+    
+        // Compute initial residual norm r_dot = r^T r
+        cublasDdot(handle, n, d_r, 1, d_r, 1, &r_dot);
+        double b_norm;
+        cublasDdot(handle, n, d_b, 1, d_b, 1, &b_norm);
+        b_norm = sqrt(b_norm);
+    
+        int k = 0;
+        while (sqrt(r_dot) / b_norm > tol && k < max_iter) {
+            // Ap = A * p
+            cublasDgemv(handle, CUBLAS_OP_N, n, n, &one, d_A, n, d_p, 1, &zero, d_Ap, 1);
+            
+            // Compute alpha = r^T r / (p^T A p)
+            cublasDdot(handle, n, d_p, 1, d_Ap, 1, &pAp);
+            alpha = r_dot / pAp;
+    
+            // x = x + alpha * p
+            cublasDaxpy(handle, n, &alpha, d_p, 1, d_x, 1);
+    
+            // r = r - alpha * Ap
+            double negalpha = -alpha;
+            cublasDaxpy(handle, n, &(negalpha), d_Ap, 1, d_r, 1);
+    
+            // Compute new r_dot = r^T r
+            cublasDdot(handle, n, d_r, 1, d_r, 1, &r_dot_new);
+    
+            // Compute beta = (new r^T r) / (old r^T r)
+            beta = r_dot_new / r_dot;
+    
+            // p = r + beta * p
+            cublasDscal(handle, n, &beta, d_p, 1);
+            cublasDaxpy(handle, n, &one, d_r, 1, d_p, 1);
+    
+            // Update r_dot for next iteration
+            r_dot = r_dot_new;
+            k++;
+        }
+    
+        // Cleanup
+        cudaFree(d_r);
+        cudaFree(d_p);
+        cudaFree(d_Ap);
+        cublasDestroy(handle);
+    
+        return k; // Return number of iterations
+    }
+
 // Solve A*x = b using cuSOLVER's Cholesky factorization.
 int solveWithCuSolver(double* A, double* x, const double* b, int n) {
     cusolverDnHandle_t cusolverH = nullptr;
@@ -540,16 +638,18 @@ int main(int argc, char* argv[]) {
             exit(EXIT_FAILURE);
         }
         
-        // Try selecting device 0 explicitly
-        int device = 0;
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess) {
-            std::cerr << "Failed to set CUDA device 0: " << cudaGetErrorString(err) << std::endl;
-            exit(EXIT_FAILURE);
+        int num_devices;
+cudaGetDeviceCount(&num_devices);
+
+
+        // Try selecting device 1 explicitly
+        int best_gpu = selectBestGPU();
+        if (best_gpu >= 0) {
+            cudaSetDevice(best_gpu);  // Set the selected GPU
+            std::cout << "Using GPU " << best_gpu << std::endl;
         }
-        
         cudaDeviceSynchronize();
-        std::cout << "Using CUDA device: " << device << std::endl;
+
         
         
     cusolverDnHandle_t cusolverH = nullptr;
@@ -564,6 +664,8 @@ int main(int argc, char* argv[]) {
     //set problem params and factorization stuff using settings.json
     std::ifstream settings_file("settings.json", std::ifstream::binary);
     nlohmann::json settings = nlohmann::json::parse(settings_file);
+
+   
     
     auto mat_set = settings["matrix_settings"];
     auto fact_set = settings["factorization_settings"];
@@ -584,6 +686,13 @@ int main(int argc, char* argv[]) {
     tmp = fact_set["floor"].dump();
     tmp = tmp.substr(1, tmp.size() - 2);
     float flr = stof(tmp);
+    tmp = fact_set["diag_pert"].dump();
+    tmp = tmp.substr(1, tmp.size() - 2);
+    bool perturb_diag = stoi(tmp) != 0;
+    tmp = fact_set["left"].dump();
+    tmp = tmp.substr(1, tmp.size() - 2);
+    bool left_looking = stoi(tmp) != 0;
+
     
 
 
@@ -632,7 +741,7 @@ int main(int argc, char* argv[]) {
     // ----------------------------
     // Run our custom solver.
     CUDA_CHECK(cudaEventRecord(start));
-    int cg_iters = precond_CG(A, x_our, b, n, r, inf_norm, eps_prime, flr);
+    int cg_iters = precond_CG(A, x_our, b, n, r, inf_norm, eps_prime, flr, perturb_diag, left_looking);
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     float time_our = 0.0f;
@@ -650,15 +759,15 @@ int main(int argc, char* argv[]) {
     printf("cuSOLVER completed in %.2f ms.\n", time_cusolver);
 
     // ----------------------------
-    // Run MKL's solver.
-    printf("Running MKL solver...\n");
-    CUDA_CHECK(cudaEventRecord(start));
-    solveWithMKL(A, x_cusolver, b, n);
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float time_mkl = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&time_mkl, start, stop));
-    printf("MKL completed in %.2f ms.\n", time_mkl);
+    // // Run MKL's solver.
+    // printf("Running MKL solver...\n");
+    // CUDA_CHECK(cudaEventRecord(start));
+    // solveWithMKL(A, x_cusolver, b, n);
+    // CUDA_CHECK(cudaEventRecord(stop));
+    // CUDA_CHECK(cudaEventSynchronize(stop));
+    // float time_mkl = 0.0f;
+    // CUDA_CHECK(cudaEventElapsedTime(&time_mkl, start, stop));
+    // printf("MKL completed in %.2f ms.\n", time_mkl);
 
 
     // Compute residual of our solver: r_our = b - A*x_our
@@ -691,6 +800,42 @@ int main(int argc, char* argv[]) {
     printf("Residual norm of our solver     : %e\n", r_our_norm);
     printf("Residual norm of cuSOLVER      : %e\n", r_cusolver_norm);
 
+    CUDA_CHECK(cudaEventRecord(start));
+
+    double *d_x_vanilla, *d_b;
+    cudaMalloc((void**)&d_x_vanilla, n * sizeof(double));
+    cudaMalloc((void**)&d_b, n * sizeof(double));
+    cudaMemcpy(d_b, b, n * sizeof(double), cudaMemcpyHostToDevice);
+
+    double* x_vanilla = (double*)malloc(n * sizeof(double)); // Fixed sizeof typo
+
+    // Run Vanilla CG
+    CUDA_CHECK(cudaEventRecord(start));
+    int vanilla_cg_iters = vanilla_CG(dA, d_x_vanilla, d_b, n);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float time_vanilla_cg = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&time_vanilla_cg, start, stop));
+    printf("Vanilla CG completed in %d iterations and took %.2f ms.\n", vanilla_cg_iters, time_vanilla_cg);
+
+    // ----------------------------
+    // Compute residual norm for Vanilla CG
+    double r_vanilla_cg_norm = 0.0;
+    for (int i = 0; i < n; i++) {
+        double Ai_x = 0.0;
+        for (int j = 0; j < n; j++) {
+            Ai_x += A[i + j * n] * x_vanilla[j];
+        }
+        double ri = b[i] - Ai_x;
+        r_vanilla_cg_norm += ri * ri;
+    }
+    r_vanilla_cg_norm = sqrt(r_vanilla_cg_norm);
+
+    // Print out the residual norm for Vanilla CG
+    printf("Residual norm of Vanilla CG    : %e\n", r_vanilla_cg_norm);
+
+
     
     // ----------------------------
     // Compare the solutions (compute relative L2 norm difference).
@@ -711,6 +856,9 @@ int main(int argc, char* argv[]) {
     // Clean up CUDA events.
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
+    cudaFree(d_x_vanilla);
+    cudaFree(d_b);
+    free(x_vanilla);
 
     
     return 0;

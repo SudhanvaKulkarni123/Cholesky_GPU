@@ -11,6 +11,13 @@
 #define MACH_EPS_FP16 0.0009765625f
 #define MACH_EPS_FP32 1.1920929e-7f
 
+enum class precisions : uint8_t {
+    fp8 = 0,
+    fp16 = 1,
+    bf16 = 2,
+    fp32 = 3
+};
+
 std::ofstream gemms_file("gemmers.csv");
 // Functor to map submatrix indices
 struct SubmatrixIndexFunctor {
@@ -69,11 +76,11 @@ struct CustomEpilogue {
 int switching_precision_Cholesky(float* d_A, int ld, int r, float* d_A_sub,
     float* diag_A, float* updated_diag,
     cublasHandle_t handle, cusolverDnHandle_t cusolverH, cudaStream_t stream,
-    int n, float eps_prime = 0.0f, float eps = 0.0f) {
+    int n, float eps_prime = 0.0f, float eps = 0.0f, bool modify_diag = false) {
 
 
 
-        float one = 1.0f;
+float one = 1.0f;
 float negOne = -1.0f;
 
 
@@ -111,7 +118,7 @@ cudaEventCreate(&start);
 cudaEventCreate(&stop);
 
 // Variables for FLOP counts
-double flops_factorize = 0, flops_trsm = 0, flops_gemm = 0;
+long long flops_factorize = 0, flops_trsm = 0, flops_gemm = 0;
 float alpha = -1.0f;
 float beta = 1.0f;
 
@@ -224,6 +231,10 @@ CUSOLVER_CHECK(
    )
 );
 
+// fixDiag<<<r*r/256, 256, 0, stream>>>(
+//     d_A + k + k*ld, r, eee
+//     eps);
+
 cudaEventRecord(stop, stream);
 cudaEventSynchronize(stop);
 float elapsed;
@@ -275,6 +286,7 @@ dim3 blockSize(16, 16);
 dim3 gridSize((sub + blockSize.x - 1) / blockSize.x, (r_block + blockSize.y - 1) / blockSize.y);
 cudaStreamSynchronize(stream);
 
+flops_gemm += 2*sub*sub*r_block;
 if(*just_switch != 0)
 {
 
@@ -324,7 +336,7 @@ typename GemmFp8Fp32::Arguments fp8_arguments{
 cudaEventRecord(start, stream);
 cutlass::Status status = lo_gemm_op(fp8_arguments);
 fixDiag<<<gridSize, blockSize, 0, stream>>>(
-    d_A + k + k*ld, n, 
+    d_A + k + r + (k + r)*ld, n, 
     eps);
 cudaEventRecord(stop, stream);
 cudaEventSynchronize(stop);
@@ -368,7 +380,7 @@ time_gemm += elapsed;
         cudaEventRecord(start, stream);
         cutlass::Status status = half_gemm_op(fp16_arguments, stream);
         fixDiag<<<gridSize, blockSize, 0, stream>>>(
-            d_A + k + k*ld, n, 
+            d_A + k + r + (k + r)*ld, n, 
             eps);
 
         cudaEventRecord(stop, stream);
@@ -394,7 +406,7 @@ time_gemm += elapsed;
 
             gemm_op_32(arguments_32);
             fixDiag<<<gridSize, blockSize, 0, stream>>>(
-                d_A + k + k*ld, n, 
+                d_A + (k + r) + (k + r)*ld, n, 
                 eps);
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
@@ -419,92 +431,169 @@ cudaEventDestroy(stop);
 // Print profiling results
 std::cout << "Profiling Results (ms) & FLOPs:\n";
 std::cout << "Factorization (A00): " << time_factorize << " ms, "
-<< "FLOPs: " << flops_factorize / 1e9 << " GFLOPs\n";
+<< "FLOPs: " << (double)flops_factorize / 1e9 << " GFLOPs\n";
 std::cout << "TRSM: " << time_trsm << " ms, "
-<< "FLOPs: " << flops_trsm / 1e9 << " GFLOPs\n";
+<< "FLOPs: " << (double)flops_trsm / 1e9 << " GFLOPs\n";
 std::cout << "Conversion (Float -> Half): " << time_conversion << " ms\n";
 std::cout << "GEMM: " << time_gemm << " ms, "
-<< "FLOPs: " << flops_gemm / 1e9 << " GFLOPs\n";
+<< "FLOPs: " << (double)flops_gemm / 1e9 << " GFLOPs\n";
 
 return 0;
 }
 
-//we only need to show the worst case, so we'll
-int left_fp8(cutlass::float_e4m3_t* d_A, int ld, int r, float* scalings,
+//we only need to show the worst case, so we'll store in fp8
+int left_fp8(cutlass::float_e4m3_t* d_A, int ld, int r, float* d_A_sup, int8_t* scalings,
     float* diag_A, float* updated_diag,
     cublasHandle_t handle, cusolverDnHandle_t cusolverH, cudaStream_t stream,
-    int n, float eps = 0.0f)
+    int n, float eps = 0.0f, int num_streams = 1)
 {
 
-int devInfo_h = 0;
-int* devInfo  = nullptr;
-CUDA_CHECK( cudaMalloc((void**)&devInfo, sizeof(int)) );
+        //declare GEMM functors-
+    using GemmFp8Fp32 = cutlass::gemm::device::Gemm<
+    cutlass::float_e4m3_t,           // ElementA (FP8)
+    cutlass::layout::RowMajor,       // LayoutA
+    cutlass::float_e4m3_t,           // ElementB (FP8)
+    cutlass::layout::ColumnMajor,       // LayoutA^T
+    float,                           // ElementC (output)
+    cutlass::layout::RowMajor,       // LayoutC
+    float,                           // ElementAccumulator (accumulation type: FP32)
+    cutlass::arch::OpClassTensorOp,  // Operator class (Tensor Ops)
+    cutlass::arch::Sm89,             // Architecture (Sm89 for FP8 support)
+    cutlass::gemm::GemmShape<128, 64, 128>,  // Threadblock shape
+    cutlass::gemm::GemmShape<64, 32, 128>,   // Warp shape
+    cutlass::gemm::GemmShape<16, 8, 32>,     // Instruction shape
+    EpilogueOutputOp,                      // **Custom No-Op Epilogue**
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Threadblock swizzle
+    4,    // Number of stages
+    16,   // Alignment A
+    16   // Alignment B
+    //cutlass::arch::OpMultiplyAddFastAccum<> // Operator
+    >;
+
+    GemmFp8Fp32 lo_gemm_op;
 
 
-int vecThreads = 64;
-int vecBlocks = (n * n + vecThreads - 1) / vecThreads;
+    float one = 1.0f;
+    float negOne = -1.0f;
+
+    precisions* prec_list = (precisions*) malloc(sizeof(uint8_t) * ((int) n / r));
+    float* debug_arr = (float*) malloc(10 * sizeof(float));
+
+    int devInfo_h = 0;
+    int* devInfo  = nullptr;
+    CUDA_CHECK(cudaMallocManaged((void**)&devInfo, sizeof(int) + sizeof(int)));
+    int* just_switch = (int*)(devInfo + 1);
+    *just_switch = 1;
+
+    // Create GEMM streams for concurrent schur update
+    cudaStream_t gemm_streams[num_streams];
+    for (int i = 0; i < num_streams; i++) {
+        CUDA_CHECK(cudaStreamCreate(&gemm_streams[i]));
+    }
+
+    int lwork = 0;
+    CUSOLVER_CHECK(
+        cusolverDnSpotrf_bufferSize(
+            cusolverH,
+            CUBLAS_FILL_MODE_LOWER, 
+            r, 
+            d_A_sup, 
+            ld,
+            &lwork
+        )
+    );
+
+    float* panel_workspace;
+    CUDA_CHECK(cudaMalloc((void**)&panel_workspace, lwork * sizeof(float)));
+
+    for (int k = 0; k < n; k += r) {
+        // Convert FP8 to float for factorization
+        dim3 vecThreads(32,32); //blocksize
+        dim3 vecBlocks((n-k + 31)/32, (r + 31)/32) ; //gridSize 
+        Fp8toFloat<<<vecBlocks, vecThreads, 0, stream>>>(d_A + k + k * ld, scalings + (k + k * ld) / r, d_A_sup, n - k, r, n, r);
+
+        if (k != 0) {
+            //first loop to go down the panel
+            for (int j = k; j < n; j += r) {
+                
+                for(int i = 0; i < k; i += r) {
+
+                        // Scaling factor
+                float to_put = -1.0 * scalings[(j) / r] * scalings[(i) / r];
+
+                typename GemmFp8Fp32::Arguments fp8_arguments{
+                    {k, k, k},                              // GEMM problem size
+                    {d_A + j, ld},             // Tensor A
+                    {d_A + k*ld, ld},             // Tensor B
+                    {d_A_sup, ld},                          // Tensor C (input/output)
+                    {d_A_sup, ld},             // Tensor D
+                    {to_put, one}                           // Epilogue parameters
+                };
+
+                lo_gemm_op.run(fp8_arguments, gemm_streams[j/r]);
 
 
-float* max_L = nullptr;
-CUDA_CHECK(cudaMallocManaged(&max_L, sizeof(float), cudaMemAttachGlobal));
+                }
 
-float h_max_L;
+                
+                
+            }     
+        }
 
-float* dev_blockMax = nullptr;
-CUDA_CHECK(cudaMalloc((void**)&dev_blockMax, vecBlocks * sizeof(float)));
+        // Panel factorization
+        float* d_panel = d_A_sup;
+        CUSOLVER_CHECK(
+            cusolverDnSpotrf(
+                cusolverH,
+                CUBLAS_FILL_MODE_LOWER, 
+                r,
+                d_panel,
+                ld,
+                panel_workspace,
+                lwork,
+                devInfo
+            )
+        );
 
-// CUDA Events for Profiling
-cudaEvent_t start, stop;
-float time_factorize = 0, time_trsm = 0, time_conversion = 0, time_gemm = 0;
-cudaEventCreate(&start);
-cudaEventCreate(&stop);
+        // TRSM before rounding down
+        CUBLAS_CHECK( 
+            cublasStrsm(
+                handle,
+                CUBLAS_SIDE_RIGHT,
+                CUBLAS_FILL_MODE_LOWER,
+                CUBLAS_OP_T,
+                CUBLAS_DIAG_NON_UNIT,
+                r, k - r, &one,
+                d_A_sup,
+                ld,
+                d_A_sup + k + r,
+                ld
+            )
+        );
 
-// Variables for FLOP counts
-double flops_factorize = 0, flops_trsm = 0, flops_gemm = 0;
-float alpha = -1.0f;
-float beta = 1.0f;
+        // Round down after TRSM
+        FloatToMXFP8<<<vecBlocks, vecThreads, sizeof(float)*1024, stream>>>(d_A_sup, scalings + (int)((k + k*ld)/r) ,d_A + k*ld + k, scalings + k + (int) k*ld/r, k - r, r, ld);
 
+    }
 
+    // Cleanup
+    for (int i = 0; i < num_streams; i++) {
+        CUDA_CHECK(cudaStreamDestroy(gemm_streams[i]));
+    }
+    CUDA_CHECK(cudaFree(panel_workspace));
+    CUDA_CHECK(cudaFree(devInfo));
+    free(debug_arr);
+    free(prec_list);
 
-using EpilogueOutputOp =  cutlass::epilogue::thread::LinearCombination<
-float, 8>;
-
-//declare GEMM functor-
-using GemmFp8Fp32 = cutlass::gemm::device::Gemm<
-cutlass::float_e4m3_t,           // ElementA (FP8)
-cutlass::layout::RowMajor,       // LayoutA
-cutlass::float_e4m3_t,           // ElementB (FP8)
-cutlass::layout::ColumnMajor,       // LayoutA^T
-float,                           // ElementC (output)
-cutlass::layout::RowMajor,       // LayoutC
-float,                           // ElementAccumulator (accumulation type: FP32)
-cutlass::arch::OpClassTensorOp,  // Operator class (Tensor Ops)
-cutlass::arch::Sm89,             // Architecture (Sm89 for FP8 support)
-cutlass::gemm::GemmShape<128, 64, 128>,  // Threadblock shape
-cutlass::gemm::GemmShape<64, 32, 128>,   // Warp shape
-cutlass::gemm::GemmShape<16, 8, 32>,     // Instruction shape
-EpilogueOutputOp,                      // **Custom No-Op Epilogue**
-cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Threadblock swizzle
-4,    // Number of stages
-16,   // Alignment A
-16   // Alignment B
-//cutlass::arch::OpMultiplyAddFastAccum<> // Operator
->;
-
-GemmFp8Fp32 lo_gemm_op;
-
-
-// typename GemmFp8Fp32::Arguments fp8_arguments{
-//     {sub, r_block, r_block},                    // GEMM problem size
-//     {d_A_sub_fp8, ld},            // Tensor A: pointer and leading dimension M
-//     {d_A_sub_fp8, ld},            // Tensor B: pointer and leading dimension K
-//     {d_A + k + r_block + (k+r_block)*ld, ld},       // Tensor C: pointer and leading dimension M (input/output)
-//     {d_A + k + r_block + (k+r_block)*ld, ld},       // Tensor D: pointer and leading dimension M (output)
-//     {to_put, one}                 // Epilogue parameters
-//     };
-    
-    
-
-    
+    return 0;
 }
+
+
+
+
+
+
+
+
+
 

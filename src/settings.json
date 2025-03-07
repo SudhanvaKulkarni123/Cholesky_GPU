@@ -1,12 +1,14 @@
 {
     "matrix_settings" : {
         "n" : "8192",
-        "condition_number" : "1000.0",
+        "condition_number" : "100.0",
         "dist_type" : "arithmetic"
     },
     "factorization_settings" : {
         "block_size" : "1024",
-        "eps_prime" : "0.0001",
-        "floor" : "0.0"
+        "eps_prime" : "0.000005",
+        "floor" : "0.01",
+        "diag_pert" : "0",
+        "left" : "0"  
     }
 }
