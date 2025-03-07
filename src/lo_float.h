@@ -1,11 +1,9 @@
 /// @author Sudhanva Kulkarni
-/* This file contains code for software defined 6 bit and 4 bit floats. It follows the same software design as Andrew Fitzgibbon's float8.h and uses std::bitset instead of uint8
+/* This file contains code for software defined 6 bit and 4 bit floats. It is an extended version of Andrew Fitzgibbon's float8.h
 */
 #ifndef ML_DTYPES_FLOAT6_4_H_
 #define ML_DTYPES_FLOAT6_4_H_
-//#define STOCHASTIC_ROUND
-//#define STOCHASTIC_ARITH
-#define LEN 13  
+#define LEN 13  //this is the length  of the bitstring used for stochastic rounding
 #include <random> 
 #include <ctime>
 #include <algorithm>
@@ -40,7 +38,13 @@
 
 
 
-
+enum Rounding_Mode : uint8_t {
+    RoundToNearestEven = 0,
+    RoundTowardsZero = 1,
+    RoundAwayFromZero = 2,
+    StochasticRounding = 3,
+    RoundToNearestOdd = 4
+}
 
 
 namespace lo_float {
@@ -274,6 +278,7 @@ private:
 
 template <typename Derived>
 class float4_base : public lo_float_base<Derived> {
+ 
     private :
         friend class lo_float_base<Derived>;
         
@@ -293,6 +298,7 @@ protected:
     {}
 
 public:
+    static Rounding_Mode round_mode; 
     // Inherit all base constructors
     using Base::Base;
 
@@ -328,6 +334,7 @@ protected:
     {}
 
 public:
+static Rounding_Mode round_mode; 
     using Base::Base;
 
     explicit EIGEN_DEVICE_FUNC operator bool() const {
@@ -352,6 +359,8 @@ protected:
     {}
 
 public:
+static Rounding_Mode round_mode; 
+
     using Base::Base;
 
     explicit EIGEN_DEVICE_FUNC operator bool() const {
@@ -1923,6 +1932,41 @@ inline Bits Stochastic_Round(Bits bits, int roundoff) {
   return to_ret;
 }
 
+template <typename Bits>
+inline Bits RoundBitsTowardsZero(Bits bits, int roundoff) {
+    // Round towards zero by just truncating the bits
+    //in bits FFF...FLRTT....T RTT....T needs to be rounded off, so just set  RTT..T to be 0
+    auto mask = ~((Bits{1} << roundoff) - 1);
+    return bits & mask;
+}
+
+
+template<typename Bits>
+inline Bits RoundBitsAwayFromZero(Bits bits, int roundoff) {
+    //Round away from Zero by truncating bits and adding one to the remaining bit pattern
+    // in bits FFF...FRTT...T, set RTT...T to be zero and add 1 to FFF...F
+    auto mask = ~((Bits{1} << roundoff) - 1);
+    Bits truncated = bits & mask;
+    return truncated + (bits > 0 ? Bits{1} << roundoff : 0);
+}
+
+template <typename Bits>
+constexpr inline Bits RoundBitsToNearestOdd(Bits bits, int roundoff) {
+    // Round to nearest odd by adding a bias term.
+    // Consider a bit pattern:
+    //   FFF...FLRTT...T,
+    // where bits RTT...T need to be rounded-off. We add a bias term to the
+    // bit pattern such that a carry is introduced to round up only if
+    // - L is 0, R is 1, OR
+    // - L is 1, R is 1, any T is one.
+    // This ensures the final result is odd.
+    
+    Bits bias = roundoff == 0
+                    ? 0
+                    : ((~bits >> roundoff) & 1) + (Bits{1} << (roundoff - 1)) - 1;
+    return bits + bias;
+}
+
 
 template <typename From, typename To, bool kSaturate, bool kTruncate>
 struct ConvertImpl<From, To, kSaturate, kTruncate,
@@ -1958,7 +2002,7 @@ struct ConvertImpl<From, To, kSaturate, kTruncate,
 
 
 //need to change the bool to an enum to support other rounding modes
-  static EIGEN_DEVICE_FUNC inline To run(const From& from, bool stochastic) {
+  static EIGEN_DEVICE_FUNC inline To run(const From& from, Rounding_Mode round_mode) {
     // Shift bits to destination type, without sign bit.
     const bool from_sign_bit =
         Eigen::numext::bit_cast<FromBits>(from) >> (kFromBits - 1);
@@ -2012,7 +2056,10 @@ struct ConvertImpl<From, To, kSaturate, kTruncate,
         } else {
           if constexpr (!kTruncate) {
             
-            if(stochastic) {bits = Stochastic_Round(bits, -kDigitShift); }
+            switch(round_mode){
+                case RoundToNearestEven :
+                bits = RoundToNe(bits, -kDigitShift);
+            } {bits = Stochastic_Round(bits, -kDigitShift); }
             
             else {bits = RoundBitsToNearestEven(bits, -kDigitShift); }
             
@@ -2124,32 +2171,23 @@ struct ConvertImpl<From, To, kSaturate, kTruncate,
 template <typename Derived>
 template <bool kSaturate, bool kTruncate, typename From>
 EIGEN_DEVICE_FUNC Derived lo_float_base<Derived>::ConvertFrom(const From& from) {
-  #ifdef STOCHASTIC_ROUND
-  return ConvertImpl<From, Derived, kSaturate, kTruncate>::run(from, true);
-  #else
   return ConvertImpl<From, Derived, kSaturate, kTruncate>::run(from, false);
-  #endif
 }
 
 template <typename Derived>
 template <typename To, bool kSaturate, bool kTruncate>
 EIGEN_DEVICE_FUNC To lo_float_base<Derived>::ConvertTo(const Derived& from) {
-   #ifdef STOCHASTIC_ROUND
-  return ConvertImpl<Derived, To, kSaturate, kTruncate>::run(from, true);
-  #else 
+
   return ConvertImpl<Derived, To, kSaturate, kTruncate>::run(from, false);
-  #endif
 
 }
 
 template <typename Derived>
 template <bool kSaturate, bool kTruncate>
 EIGEN_DEVICE_FUNC double lo_float_base<Derived>::ConvertTo(const Derived& from) {
-  #ifdef STOCHASTIC_ARITH
-  return ConvertImpl<Derived, double, kSaturate, kTruncate>::run(from, true);
-  #else 
+
   return ConvertImpl<Derived, double, kSaturate, kTruncate>::run(from, false);
-  #endif
+
 
 
 }
@@ -2157,11 +2195,9 @@ EIGEN_DEVICE_FUNC double lo_float_base<Derived>::ConvertTo(const Derived& from) 
 template <typename Derived>
 template <bool kSaturate, bool kTruncate>
 EIGEN_DEVICE_FUNC Derived lo_float_base<Derived>::ConvertFrom(const double& from) {
-  #ifdef STOCHASTIC_ARITH
-  return ConvertImpl<double, Derived, kSaturate, kTruncate>::run(from, true);
-  #else
+
   return ConvertImpl<double, Derived, kSaturate, kTruncate>::run(from, false);
-  #endif
+
 
 }
 

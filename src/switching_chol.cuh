@@ -523,19 +523,15 @@ int left_fp8(cutlass::float_e4m3_t* d_A, int ld, int r, float* d_A_sup, int8_t* 
 
                 typename GemmFp8Fp32::Arguments fp8_arguments{
                     {k, k, k},                              // GEMM problem size
-                    {d_A + j, ld},             // Tensor A
-                    {d_A + k*ld, ld},             // Tensor B
+                    {d_A + k*ld + j, ld},             // Tensor A
+                    {d_A + k*ld + i, ld},             // Tensor B
                     {d_A_sup, ld},                          // Tensor C (input/output)
                     {d_A_sup, ld},             // Tensor D
                     {to_put, one}                           // Epilogue parameters
                 };
 
-                lo_gemm_op.run(fp8_arguments, gemm_streams[j/r]);
-
-
+                lo_gemm_op(fp8_arguments, gemm_streams[(int)j/r]);
                 }
-
-                
                 
             }     
         }
@@ -572,7 +568,7 @@ int left_fp8(cutlass::float_e4m3_t* d_A, int ld, int r, float* d_A_sup, int8_t* 
         );
 
         // Round down after TRSM
-        FloatToMXFP8<<<vecBlocks, vecThreads, sizeof(float)*1024, stream>>>(d_A_sup, scalings + (int)((k + k*ld)/r) ,d_A + k*ld + k, scalings + k + (int) k*ld/r, k - r, r, ld);
+        FloatToMXFP8<<<vecBlocks, vecThreads, sizeof(float)*1024, stream>>>(d_A_sup, scalings + (int)((k + k*ld)/r) ,d_A + k*ld + k, k - r, r, ld, r);
 
     }
 

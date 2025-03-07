@@ -2,11 +2,6 @@
 #include "tlapack/lapack/lacpy.hpp"
 #include "tlapack/base/utils.hpp"
 #include "tlapack/blas/gemm.hpp"
-#include "tlapack/blas/iamax.hpp"
-#include "tlapack/blas/swap.hpp"
-#include "tlapack/blas/trsm.hpp"
-#include "tlapack/lapack/rscl.hpp"
-#include "tlapack/blas/gemv.hpp"
 #include "tlapack/plugins/legacyArray.hpp"
 #include <omp.h>
 
