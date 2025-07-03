@@ -7,7 +7,7 @@ TARGET = mixed_cholesky
 SRCS = mixed_cholesky.cu
 
 # Compilation flags
-CFLAGS = -arch=sm_89 -std=c++20 -O3 -use_fast_math -w
+CFLAGS = -arch=sm_90 -std=c++20 -O3 -use_fast_math -w
 
 # MKL Paths
 MKLROOT = /ecad/tools/intel/oneapi-2024.0.1/mkl/2024.0
@@ -29,7 +29,7 @@ $(TARGET): $(SRCS)
 
 # Linter target
 lint:
-	clang-tidy $(SRCS) -- -x cuda --cuda-gpu-arch=sm_89 $(CFLAGS) $(INCLUDE_PATH)
+	clang-tidy $(SRCS) -- -x cuda --cuda-gpu-arch=sm_90 $(CFLAGS) $(INCLUDE_PATH)
 
 # Static analysis for CUDA
 cuda-check:
