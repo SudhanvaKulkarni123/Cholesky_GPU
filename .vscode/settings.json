@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "limits": "cpp",
+        "valarray": "cpp",
+        "algorithm": "cpp",
+        "complex": "cpp"
+    }
+}

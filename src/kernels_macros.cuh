@@ -22,6 +22,13 @@
 
 namespace cg = cooperative_groups;
 
+enum class DistType {
+    RandomLogUniform,   // Type 1
+    Clustered,          // Type 2
+    Arithmetic,         // Type 3
+    Geometric           // Type 4
+};
+
 
 using namespace std;
 // Error-checking macros
@@ -371,9 +378,32 @@ __global__ void floatToFp8E5M2Kernel(const float* __restrict__ src, uint8_t* __r
     }
 }
 
+__global__ void Equilibrate_s1(const float* __restrict__ d_in, 
+                                   int* __restrict__ D, int n, int ld)
+{
+    //two dimensional kernel launch
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; tid < n; tid += blockDim.x * gridDim.x) {
+        int offset = tid + tid * ld;
+        int exp = 0;
+        frexp(d_in[offset], &exp);
+        D[tid] = exp + 127;  // Store the exponent adjusted for E8M0
+    }
+
+    return;
+
+}
+
+__global__ void Equilibrate_s2(const float* __restrict__ d_in,
+                                   int* __restrict__ D, int n, int ld)                                  
+{
+    //use elems in D to scale the matrix
+
+}
+
 // Extract the diagonal (for a matrix in column-major order).
 __global__ void extractDiagonal(const double* __restrict__ d_in,
-                                double* __restrict__ D, int n, int ld)
+                                double* __restrict__ D, int n, int ld, bool po2 = false)
 {
     // Use a grid-stride loop over diagonal indices.
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -381,13 +411,14 @@ __global__ void extractDiagonal(const double* __restrict__ d_in,
          i += blockDim.x * gridDim.x)
     {
         int offset = i + i * ld;
-        D[i] = d_in[offset];
+        int exp = 0;
+        D[i] = d_in[offset];  
     }
 }
 
 
 ///kerneel to update diagonal with O(nb) work 
-__global__ void update_diag(const float* __restrict__ diag_A, float* __restrict__ updated_diag, float* __restrict__ L_block, int n, int k, int ld)
+__global__ void update_diag(float* __restrict__ updated_diag, float* __restrict__ L_block, int n, int k, int ld)
 {
     
     for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
@@ -403,19 +434,26 @@ __global__ void update_diag(const float* __restrict__ diag_A, float* __restrict_
 }
 __global__ void can_switch(const float* __restrict__ diag_A, 
     float* __restrict__ updated_diag, 
-    float mach_eps, float eps_prime, int n, 
+    float* __restrict__ mach_eps, int num_prec, float eps_prime, int n, 
     int* to_ret)  // ✅ Store as int for atomic operations
 {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
+        int count = 0;
+        
+
         while (i < n)  
         {
-            if (mach_eps * updated_diag[i] >= eps_prime * diag_A[i]) {
-            atomicExch(to_ret, 0);  // ✅ Atomically set to false (0)
+        while(count < num_prec) {
+            if (mach_eps[count] * updated_diag[i] >= eps_prime * diag_A[i]) {
+            atomicExch(to_ret, count);  // ✅ Atomically set to false (0)
             return;
             }
-        i += gridDim.x * blockDim.x;  
+            count++;
         }
+        i += gridDim.x * blockDim.x;  
+    }
 }
+
 // Normalize a matrix by dividing each column by its diagonal element.
 // The matrix is assumed to be stored in column-major order.
 __global__ void normalizeMatrix(double* __restrict__ d_in,
@@ -792,27 +830,74 @@ __global__ void update_search_dir(double* __restrict__ p, const double* z, const
 
 }
 
-
-__global__ void construct_diag_geom(double* __restrict__ D, const double* cond, int n)
-{
-    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
-    {
-        D[n*i + i] = pow(1.0/(*cond), double(i)/ double(n - 1)); 
+// Kernel: Log-uniform random distribution (Type 1)
+__global__ void construct_diag_logrand(double* diag, const double* cond, int n, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+        double log_min = log10(1.0 / (*cond));
+        double log_max = 0.0;
+        double r = curand_uniform_double(&state);
+        double log_sigma = log_min + r * (log_max - log_min);
+        double sigma = pow(10.0, log_sigma);
+        diag[idx * n + idx] = sigma;
     }
 }
 
-__global__ void construct_diag_arith(double* __restrict__ D, const double* cond, int n)
-{
-    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
-    {
-        double frac = static_cast<double>(i) / (n - 1);
+// Kernel: Clustered distribution (Type 2)
+__global__ void construct_diag_clustered(double* diag, const double* cond, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        double val = (idx < n - 1) ? 1.0 : 1.0 / (*cond);
+        diag[idx * n + idx] = val;
+    }
+}
 
-        // Interpolate from 1.0 at i=0 to 1.0 / (*cond) at i=n-1:
-        double val  = 1.0 + frac * (1.0 / (*cond) - 1.0);
+// Kernel: Arithmetic decay (Type 3)
+__global__ void construct_diag_arith(double* diag, const double* cond, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        double i = static_cast<double>(idx);
+        double factor = (1.0 - i / (n - 1.0)) * (1.0 - 1.0 / (*cond));
+        diag[idx * n + idx] = 1.0 - factor;
+    }
+}
 
-        D[i*n + i] = val;
+// Kernel: Geometric decay (Type 4)
+__global__ void construct_diag_geom(double* diag, const double* cond, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        double exponent = static_cast<double>(idx) / (n - 1.0);
+        diag[idx * n + idx] = pow(*cond, -exponent);
+    }
+}
+
+// Dispatcher function
+inline void launch_construct_diag(double* d_diagVals, const double* d_cond, int n, DistType dist, cudaStream_t stream) {
+    int blockSize = 256;
+    int gridSize = (n + blockSize - 1) / blockSize;
+    unsigned long long seed = 123456789ULL;
+
+    switch (dist) {
+        case DistType::RandomLogUniform:
+            construct_diag_logrand<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n, seed);
+            break;
+        case DistType::Clustered:
+            construct_diag_clustered<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+            break;
+        case DistType::Arithmetic:
+            construct_diag_arith<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+            break;
+        case DistType::Geometric:
+            construct_diag_geom<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+            break;
     }
 
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 __global__ void scaleColumnsByDiag(const double* __restrict__ diagVals, 

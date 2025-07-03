@@ -249,10 +249,15 @@ void generatePSD(double* dA,
     int blockSize = 256;
     int gridSize  = (n + blockSize - 1) / blockSize;
 
-    if(dist == DistType::Geometric) {
-        construct_diag_geom<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
-    } else {
+    unsigned long long seed = 123456789; // Random seed for reproducibility
+    if (dist == DistType::RandomLogUniform) {
+        construct_diag_logrand<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n, seed);
+    } else if (dist == DistType::Clustered) {
+        construct_diag_clustered<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+    } else if (dist == DistType::Arithmetic) {
         construct_diag_arith<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
+    } else if (dist == DistType::Geometric) {
+        construct_diag_geom<<<gridSize, blockSize, 0, stream>>>(d_diagVals, d_cond, n);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
  

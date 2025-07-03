@@ -12,7 +12,8 @@
 #include <mkl.h>
 
 
-
+#define MAX_THREADS 1024
+#define MAX_NUM_BLOCKS(N) ((N + MAX_THREADS - 1) / MAX_THREADS)
 
 int selectBestGPU() {
     int num_devices;
@@ -47,9 +48,7 @@ int selectBestGPU() {
     return best_device;
 }
 
-enum distr_type : uint8_t {
-    Arith, Geom, Rand
-};
+
 
 void host_isnan(float* A, int n)
 {
@@ -74,409 +73,157 @@ int vanilla_CG(double* A, double* x, double* b, int n, double normA)
 // precond_CG function
 //-----------------------------
 int precond_CG(double* A, double* x,
-               double* b, int n, int r, double normA, float eps_prime = 0.0f, float flr = 0.0f, bool perturb_diab = false, bool left_looking = false) {
+               double* b, int n, int r, double normA, float eps_prime = 0.0f, float flr = 0.0f, bool perturb_diag = false, int microscal_size = 32) {
 
 
-    
-    std::ofstream myfile("e5m2_error_f_cond.csv");
-    cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
+                //start with memory allocation -- first calculate total needed memory so that we makee only one syscall
+size_t total_memory = 0;
+
+    size_t bytes_LL_cpy     = n * n * sizeof(double);        // LL^T copy
+    size_t bytes_A          = n * n * sizeof(float);         // For computing LL^T
+    size_t bytes_diag_a     = n * sizeof(float);             // diag_a
+    size_t bytes_updated    = n * sizeof(float);             // updated_diag
+    size_t bytes_scales     = (2*n*n / microscal_size) * sizeof(uint8_t);  // scale factors
+    size_t equilibration_arr = n * sizeof(int); // For equilibration
+    size_t bytes_vec        = n * sizeof(double); 
+
+    total_memory = bytes_LL_cpy + bytes_A + bytes_diag_a + bytes_updated + bytes_scales + equilibration_arr + 4*bytes_vec;
+
+    // Allocate all at once
+    void* base_ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&base_ptr, total_memory));
+
+    uint8_t* raw = static_cast<uint8_t*>(base_ptr);
+
+    double* d_LL_cpy       = reinterpret_cast<double*>(raw);          raw += bytes_LL_cpy;
+    float*  d_A_float      = reinterpret_cast<float* >(raw);          raw += bytes_A_float;
+    float*  d_diag_a       = reinterpret_cast<float* >(raw);          raw += bytes_diag_a;
+    float*  d_updated_diag = reinterpret_cast<float* >(raw);          raw += bytes_updated;
+    uint8_t* d_scales      = reinterpret_cast<uint8_t*>(raw);         raw += bytes_scales;
+    int*    d_equil        = reinterpret_cast<int*   >(raw);          raw += bytes_equil;
+    double* d_r            = reinterpret_cast<double*>(raw);          raw += bytes_vec;
+    double* d_p            = reinterpret_cast<double*>(raw);          raw += bytes_vec;
+    double* d_z            = reinterpret_cast<double*>(raw);          raw += bytes_vec;
+    double* d_Ap           = reinterpret_cast<double*>(raw);          /*done*/
 
 
+    // Initialize cuBLAS and cuSOLVER handles
+    cublasHandle_t cublasH;
+    cusolverDnHandle_t cusolverH;
+    CUBLAS_CHECK(cublasCreate(&cublasH));
+    CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));  // Still creating a stream for kernels/BLAS if we like
-    cudaStream_t logging_stream;
-    CUDA_CHECK(cudaStreamCreate(&logging_stream));
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
-    cusolverDnHandle_t CuHandle_t;
-    CUSOLVER_CHECK(cusolverDnCreate(&CuHandle_t));
-    CUSOLVER_CHECK(cusolverDnSetStream(CuHandle_t, stream));
+    CUBLAS_CHECK(cublasSetStream(cublasH, stream));
+    CUSOLVER_CHECK(cusolverDnSetStream(cusolverH, stream));
 
+    // copy A to bytes_A, while rounding to single prec
+    convertDoubleToFloat<<<MAX_NUM_BLOCKS(n*n), MAX_THREADS, 0>>>(A, d_A, n * n);
+
+    //equilibrate A if needed here
+
+
+    //extract diagonal of A to d_diag_a
+    extractDiagonal<<<MAX_NUM_BLOCKS(n), MAX_THREADS, 0>>>(d_A, d_diag_a, n);
+
+    //prepare updated_diag
+    CUDA_CHECK(cudaMemcpy(d_updated_diag, d_diag_a, bytes_diag_a, cudaMemcpyDeviceToDevice));
+
+    // you can now call switching_cholesky
+    switching_chol(d_A, n, r, d_diag_a, d_updated_diag, d_scales, eps_prime, perturb_diag, microscal_size,
+                   cusolverH, cublasH, stream, d_scales);
     
-
-
-    double One = 1.0;
-    float Onef = 1.0f;
-    double Zero = 0.0;
-    double NegOne = -1.0;
-
-    
-    cudaEvent_t init_start, init_stop;
-     CUDA_CHECK(cudaEventCreate(&init_start));
-    CUDA_CHECK(cudaEventCreate(&init_stop));
-    CUDA_CHECK(cudaEventRecord(init_start, stream)); 
-// Compute total memory required
-size_t size_A_d = n * n * sizeof(double);
-size_t size_A_f = n * n * sizeof(float);
-size_t max_buff_size = n * r * sizeof(float);  // Matul buffer size
-size_t vec_size = n * sizeof(double);
-size_t half_vec_size = n * sizeof(float);  // For float vectors
-size_t scal_size = sizeof(double);
-size_t perm_size = n * sizeof(int);
-
-
-
-// Total size to allocate in a single call
-size_t workspace_size = n * n * sizeof(float);  // New workspace buffer
-
-size_t total_size = 
-    size_A_d +  // d_A
-    size_A_f +  // s_A
-    workspace_size + // New workspace buffer
-    size_A_d +  // LL_copy
-    7 * vec_size +  // dev_x, dev_b, dev_r, p, Ap, dev_z, dev_D (all double)
-    2 * half_vec_size +  // diag_A, updated_diag (float)
-    4 * scal_size +  // pAp, rz, rz_new, inf_norm_r (double)
-    3 * scal_size +  // d_One, d_Zero, d_NegOne (double)
-    2 * perm_size + sizeof(int);  // dev_left_perm, dev_right_perm (int)
-
-// Allocate memory
-void* d_mem = nullptr;
-CUDA_CHECK(cudaMalloc(&d_mem, total_size));
-
-char* d_mem_char = reinterpret_cast<char*>(d_mem);
-
-double* d_A        = reinterpret_cast<double*>(d_mem_char);
-double* LL_copy    = reinterpret_cast<double*>(d_mem_char + size_A_d);  // LL_copy right after d_A
-float* s_A         = reinterpret_cast<float*>(d_mem_char + size_A_d + size_A_d);
-float* workspace   = reinterpret_cast<float*>(d_mem_char + size_A_d + size_A_d + size_A_f);  // Workspace right after s_A
-
-double* dev_x      = reinterpret_cast<double*>(d_mem_char + size_A_d + size_A_d + size_A_f + workspace_size);
-double* dev_b      = dev_x + n;
-double* dev_r      = dev_b + n;
-double* p          = dev_r + n;
-double* Ap         = p + n;
-double* dev_z      = Ap + n;
-double* dev_D      = dev_z + n;
-
-float* diag_A      = reinterpret_cast<float*>(dev_D + n);  
-float* updated_diag= diag_A + n;
-
-double* pAp        = reinterpret_cast<double*>(updated_diag + n);
-double* rz         = pAp + 1;
-double* rz_new     = rz + 1;
-double* inf_norm_r = rz_new + 1;
-
-double* d_One      = inf_norm_r + 1;
-double* d_Zero     = d_One + 1;
-double* d_NegOne   = d_Zero + 1;
-
-int* dev_left_perm  = reinterpret_cast<int*>(d_NegOne + 1);
-int* dev_right_perm = dev_left_perm + n;
-int* devInfo = dev_right_perm + n;
-
-
-// Copy scalar values asynchronously
-CUDA_CHECK(cudaMemcpyAsync(d_One,    &One,    scal_size, cudaMemcpyHostToDevice, stream));
-CUDA_CHECK(cudaMemcpyAsync(d_Zero,   &Zero,   scal_size, cudaMemcpyHostToDevice, stream));
-CUDA_CHECK(cudaMemcpyAsync(d_NegOne, &NegOne, scal_size, cudaMemcpyHostToDevice, stream));
-
-// Allocate host memory for preconditioner
-double* D_host       = (double*)malloc(n * sizeof(double));
-int* left_perm_host  = (int*)malloc(n * sizeof(int));
-int* right_perm_host = (int*)malloc(n * sizeof(int));
-
-// Initialize preconditioner data
-for (int i = 0; i < n; i++) {
-    left_perm_host[i] = i;
-    right_perm_host[i] = i;
-    D_host[i] = 1.0;  // Example
-}
-
-// Copy permutation and preconditioner data asynchronously
-CUDA_CHECK(cudaMemcpyAsync(dev_left_perm, left_perm_host, perm_size, cudaMemcpyHostToDevice, stream));
-CUDA_CHECK(cudaMemcpyAsync(dev_right_perm, right_perm_host, perm_size, cudaMemcpyHostToDevice, stream));
-CUDA_CHECK(cudaMemcpyAsync(dev_D, D_host, vec_size, cudaMemcpyHostToDevice, stream));
-
-    // Copy matrix A and vector b from host to device (synchronous).
-    CUDA_CHECK(cudaMemcpyAsync(d_A, A, size_A_d, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    CUDA_CHECK(cudaMemcpyAsync(dev_b, b, vec_size, cudaMemcpyHostToDevice, stream));
-
-    // Initialize search direction p with b (synchronous).
-    CUDA_CHECK(cudaMemcpyAsync(p, b, vec_size, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Convert double-precision matrix to single precision (kernel uses stream).
-    int totalElems = n * n;
-    int threads = 256;
-    int blocks = (totalElems + threads - 1) / threads;
-    convertDoubleToFloat<<<blocks, threads, 0, stream>>>(d_A, s_A, totalElems);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-
-    blocks = (n + threads - 1)/threads;
-    copy_diag<<<blocks, threads, 0, stream>>>(diag_A, updated_diag, s_A, n);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaEventRecord(init_stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(init_stop));
-    float time_init = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&time_init, init_start, init_stop));
-    printf("initializartion took %.2f ms.\n", time_init);
-    // cudaEventRecord(stop);
-    // CUDA_CHECK(cudaEventSynchronize(stop));
-    // float time_init = 0.0f;
-    // CUDA_CHECK(cudaEventElapsedTime(&time_init, start, stop));
-    // printf("initialization took %.2f ms.\n", time_init);
-
-
-
-    // Perform mixed-precision Cholesky factorization on s_A (with your function).
-
-
-
-    CUDA_CHECK(cudaEventRecord(start, stream));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    //uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
-    //uniform_prec_fused_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
-    //uniform_prec_GPU_cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t ,stream, n);
-    //uniform_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, stream, n);
-     //halfprec_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::half_t*>(workspace));
-    //fp8_mixed_precision_Cholesky(s_A, n, r, diag_A, updated_diag, handle, CuHandle_t, stream, n, reinterpret_cast<cutlass::float_e4m3_t*>(workspace), flr);
-
-    switching_precision_Cholesky(s_A, n, r, workspace, diag_A, updated_diag, handle, CuHandle_t, stream, n, eps_prime, flr);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-      CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float time_our = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&time_our, start, stop));
-    printf("mixed precision cholesky took %.2f ms.\n", time_our);
-
-    //perform trmm to see if we get back same matrix
-
-    #ifdef DEBUG_MODE
-    float* debug_mat = nullptr;
-    float* host_debug_mat = (float*) malloc(n*n*sizeof(float));
-    CUDA_CHECK(cudaMalloc((void**) &debug_mat, n*n*sizeof(float)));
-    CUDA_CHECK(cudaMemset(debug_mat, 0.0f, n*n*sizeof(float)));
-    set_identity<<<blocks, threads, 0, stream>>>(debug_mat, n);
-    CUBLAS_CHECK(cublasStrmm(
-        handle,
-        CUBLAS_SIDE_LEFT,
-        CUBLAS_FILL_MODE_LOWER,
-        CUBLAS_OP_N,
-        CUBLAS_DIAG_NON_UNIT,
-        n,          // # of rows of debug_mat
-        n,          // # of columns of debug_mat
-        &Onef,
-        s_A, n,     // pointer to L
-        debug_mat, n,
-        debug_mat, n
-    ));
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUBLAS_CHECK(cublasStrmm(
-        handle,
-        CUBLAS_SIDE_LEFT,
-        CUBLAS_FILL_MODE_LOWER,
-        CUBLAS_OP_T,      // now use the transpose of L
-        CUBLAS_DIAG_NON_UNIT,
-        n,  // # rows
-        n,  // # cols
-        &Onef,
-        s_A, n,
-        debug_mat, n,
-        debug_mat, n
-    ));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-
-
-    #endif
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    
-
-    CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE));
-
-
-    // Convert factorized single-precision matrix back to double
-    convertFloattoDouble<<<blocks, threads, 0, stream>>>(s_A, LL_copy, totalElems);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Solve L y = b then L^T x = y; use p as temp
-    float time_init_soln;
-    cudaEventRecord(start, stream);
-    CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
-
-    cudaEventRecord(stop, stream);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time_init_soln, start, stop);
-
-
-    // Set dev_x = p (device to device copy - synchronous).
-    CUDA_CHECK(cudaMemcpy(dev_x, p, vec_size, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // r = b - A*x
-    CUBLAS_CHECK(cublasDgemv(handle, CUBLAS_OP_N, n, n, d_NegOne,
-                             d_A, n, dev_x, 1, d_One, dev_b, 1));           //doesnt matter if its row or col major
-    CUDA_CHECK(cudaMemcpy(dev_r, dev_b, vec_size, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-     double cpu_inf_norm_r = 0.0;
-
-    int vecThreads = 256;
-    int vecBlocks = (n + vecThreads - 1) / vecThreads;
-
-        // Allocate temporary device memory to store per-block maximums.
-    double* dev_blockMax = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&dev_blockMax, vecBlocks * sizeof(double)));
-
-    vanilla_Max<<<vecBlocks, vecThreads, vecThreads * sizeof(double), stream>>>(dev_r, dev_blockMax, n);
-
-    int finalThreads = 256;
-
-    final_max_reduce<<<1, finalThreads, finalThreads * sizeof(double), stream>>>(dev_blockMax, inf_norm_r, vecBlocks);
-
-    // Wait for the kernels to finish.
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Free the temporary block maximum array.
-    CUDA_CHECK(cudaFree(dev_blockMax));
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-       
-    // synchronous memcpy from device to host
-    CUDA_CHECK(cudaMemcpy(&cpu_inf_norm_r, inf_norm_r, sizeof(double), cudaMemcpyDeviceToHost));
-
-    double init_residual = cpu_inf_norm_r / normA;
-    std::cout << "init residual is : " << init_residual << std::endl;
-
-
-    float time_init_precond;
-    // Compute r^T z
-    cudaEventRecord(start, stream);
-    CUDA_CHECK(cudaMemcpy(dev_z, dev_r, vec_size, cudaMemcpyDeviceToDevice));
-    CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
-
-
-    CUBLAS_CHECK(cublasDdot(handle, n, dev_z, 1, dev_r, 1, rz));
-
-    CUDA_CHECK(cudaMemcpy(p, dev_z, vec_size, cudaMemcpyDeviceToDevice));
-    cudaEventRecord(stop, stream);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time_init_precond, start, stop);
-
-    const double d_conv_bound = 1e-14;
-    int count = 0;
-
-    float gemv_CG_time = 0;
-    float trsv_CG_time = 0;
-
-    float update_search_time = 0;
-
-    // CG loop
-    const int max_CG_iter = 1000;
-    for (int j = 0; j < max_CG_iter; j++) {
-        // Ap = A * p
-        cudaEventRecord(start, stream);
-        CUBLAS_CHECK(cublasDgemv(handle, CUBLAS_OP_N, n, n,
-                                 d_One, d_A, n, p, 1, d_Zero, Ap, 1));          //doesnt matter if its row or col major
-        
-        CUBLAS_CHECK(cublasDdot(handle, n, Ap, 1, p, 1, pAp));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        float elapsed_time;
-        cudaEventElapsedTime(&elapsed_time, start, stop);
-        gemv_CG_time += elapsed_time;
-
-
-
-        // x_r_update kernel
-  
-        x_r_update<<<vecBlocks, vecThreads, sizeof(double), stream>>>(dev_x, dev_r, rz, pAp, p, Ap, n);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Compute infinity norm of residual
-         vanilla_Max<<<vecBlocks, vecThreads, vecThreads * sizeof(double), stream>>>(dev_r, dev_blockMax, n);
-         final_max_reduce<<<1, finalThreads, finalThreads * sizeof(double), stream>>>(dev_blockMax, inf_norm_r, vecBlocks);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-       
-        // synchronous memcpy from device to host
-        CUDA_CHECK(cudaMemcpy(&cpu_inf_norm_r, inf_norm_r, sizeof(double), cudaMemcpyDeviceToHost));
-
-        double scaled_residual = cpu_inf_norm_r / normA;
-        myfile << j << "," << scaled_residual << std::endl;
-        if (scaled_residual < d_conv_bound) {
-            count = j + 1;
-            std::cout << "Converged in " << count << " iterations." << std::endl;
-
-            break;
-        }
-
-        // Preconditioning
- 
-        CUDA_CHECK(cudaMemcpy(dev_z, dev_r, vec_size, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Scale dev_z by D
-        //diag_scal<<<vecBlocks, vecThreads, 0, stream>>>(dev_z, dev_z, dev_D, n);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        cudaEventRecord(start, stream);
-        CUSOLVER_CHECK(cusolverDnDpotrs(CuHandle_t, CUBLAS_FILL_MODE_LOWER, n, 1, LL_copy, n, dev_z, n, devInfo));
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        float elapsed_time2;
-        cudaEventElapsedTime(&elapsed_time2, start, stop);
-        trsv_CG_time += elapsed_time2;
-
-        // Scale dev_z by D again
-        // diag_scal<<<vecBlocks, vecThreads, 0, stream>>>(dev_z, dev_z, dev_D, n);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Compute r^T z
-        CUBLAS_CHECK(cublasDdot(handle, n, dev_r, 1, dev_z, 1, rz_new));
-
-        // p = z + beta * p
-        cudaEventRecord(start, stream);
-        update_search_dir<<<vecBlocks, vecThreads, sizeof(double), stream>>>(p, dev_z, rz_new, rz, n);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
-        float elapsed_time3;
-        cudaEventElapsedTime(&elapsed_time3, start, stop);
-        update_search_time += elapsed_time3;
-
-        CUDA_CHECK(cudaMemcpy(rz, rz_new, sizeof(double), cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        count++;
+    // Copy LL^T to d_LL_cpy
+    // This assumes that switching_chol has filled d_A with LL^T.
+    convertFloatToDouble<<<MAX_NUM_BLOCKS(n*n), MAX_THREADS, 0>>>(d_A, d_LL_cpy, n * n);
+
+    //now guess initial solution to Ax = b. Use potrs
+
+    CUDA_CHECK(cudaMemcpyAsync(x, b, n*sizeof(double), cudaMemcpyDeviceToDevice, stream));
+    int info;
+    CUSOLVER_CHECK(
+        cusolverDnDpotrs(cusolverH, CUBLAS_FILL_MODE_LOWER, n, 1, d_LL_cpy, n, x, n, &info));
+    if (info) return info;          // preconditioner failed
+
+    const double d_negone = -1.0, d_one = 1.0, d_zero = 0.0;
+
+    CUBLAS_CHECK(
+        cublasDgemv(cublasH, CUBLAS_OP_N,
+                    n, n, &d_negone,
+                    A, n,            // << use original double-precision A
+                    x, 1,
+                    &d_zero,
+                    d_r, 1));        // d_r = −A x
+
+    CUBLAS_CHECK(cublasDaxpy(cublasH, n, &d_one, b, 1, d_r, 1));   // r += b
+
+    // ───────────── 5. z₀ = M⁻¹ r₀ ;  p₀ = z₀ ───────────────────────
+    CUDA_CHECK(cudaMemcpyAsync(d_z, d_r, n*sizeof(double),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUSOLVER_CHECK(
+        cusolverDnDpotrs(cusolverH, CUBLAS_FILL_MODE_LOWER,
+                         n, 1, d_LL_cpy, n, d_z, n, &info));
+    if (info) return info;
+
+    CUBLAS_CHECK(cublasDcopy(cublasH, n, d_z, 1, d_p, 1));
+
+    double rho, rho_old, resid, normb;
+    CUBLAS_CHECK(cublasDdot(cublasH, n, d_r, 1, d_z, 1, &rho));
+    CUBLAS_CHECK(cublasDnrm2(cublasH, n, b, 1, &normb));
+    resid = sqrt(rho) / normb;
+
+    // ───────────── 6. PCG loop (all double) ────────────────────────
+    int k = 0;
+    while (resid > rel_tol && k < max_it)
+    {
+        ++k;
+
+        // Ap = A p
+        CUBLAS_CHECK(
+            cublasDgemv(cublasH, CUBLAS_OP_N,
+                        n, n, &d_one,
+                        A, n,
+                        d_p, 1,
+                        &d_zero,
+                        d_Ap, 1));
+
+        double alpha_den;
+        CUBLAS_CHECK(cublasDdot(cublasH, n, d_p, 1, d_Ap, 1, &alpha_den));
+        double alpha = rho / alpha_den;
+
+        CUBLAS_CHECK(cublasDaxpy(cublasH, n, &alpha, d_p , 1, x , 1));  // x ← x+αp
+        double neg_alpha = -alpha;
+        CUBLAS_CHECK(cublasDaxpy(cublasH, n, &neg_alpha, d_Ap, 1, d_r, 1)); // r ← r-αAp
+
+        // z = M⁻¹ r
+        CUDA_CHECK(cudaMemcpyAsync(d_z, d_r, n*sizeof(double),
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUSOLVER_CHECK(
+            cusolverDnDpotrs(cusolverH, CUBLAS_FILL_MODE_LOWER,
+                             n, 1, d_LL_cpy, n, d_z, n, &info));
+        if (info) return info;
+
+        rho_old = rho;
+        CUBLAS_CHECK(cublasDdot(cublasH, n, d_r, 1, d_z, 1, &rho));
+
+        double beta = rho / rho_old;
+        CUBLAS_CHECK(cublasDscal(cublasH, n, &beta, d_p, 1));      // p = βp
+        CUBLAS_CHECK(cublasDaxpy(cublasH, n, &d_one, d_z, 1, d_p, 1)); // p = z+βp
+
+        resid = sqrt(rho) / normb;
     }
 
+    // ───────────── done – x already holds solution ─────────────────
+    cudaFree(base_ptr);
+    cublasDestroy(cublasH);
+    cusolverDnDestroy(cusolverH);
+    cudaStreamDestroy(stream);
 
-    printf("GEMVs in CG took %.2f ms.\n", gemv_CG_time);
-    printf("trsv in CG took %.2f ms.\n", trsv_CG_time);
-    printf("search dir update in CG took %.2f ms.\n", update_search_time);
-
-
-
-
-    float epilogue_time;
-    // Copy final solution to host
-    CUDA_CHECK(cudaMemcpy(x, dev_x, vec_size, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Clean up
-   CUDA_CHECK(cudaFree(d_mem));
-
-    CUBLAS_CHECK(cublasDestroy(handle));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaStreamDestroy(logging_stream));
+    return (resid <= rel_tol) ? 0 : -1;   // 0 = converged
 
 
-
-    myfile.close();
-
-    return count;
+    
     } // End CG loop.
 
 
