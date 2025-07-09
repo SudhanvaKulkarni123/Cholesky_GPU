@@ -9,10 +9,14 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cusolverDn.h>
 #include <curand.h>
-#include <cublasLt.h>
 #include <cooperative_groups.h>
+#include <cuda_fp16.h>
+#include <curand_kernel.h>
+
+
 
 
 namespace cg = cooperative_groups;
@@ -68,16 +72,7 @@ using namespace std;
         }                                                           \
     } while (0)
 
-//---------------------------------------------------------------------
-// Utility function: compute permutation indices from a permutation vector.
-void perm_to_ind(vector<int>& perm, vector<int>& ind, int n) {
-    ind.resize(n);
-    for (int i = 0; i < n; i++) 
-        ind[i] = i;
-    for (int i = n - 1; i >= 0; i--) {
-        swap(ind[perm[i]], ind[i]);
-    }
-}
+
 
 // Convert a double array to a float array.
 __global__ void convertDoubleToFloat(const double* __restrict__ d_in,
@@ -117,7 +112,7 @@ __global__ void convertFloattoDouble(const float* __restrict__ s_in,
 }
 
 //float to half
-__global__ void convertFloatToHalf(const float* __restrict__ src, cutlass::half_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
+__global__ void convertFloatToHalf(const float* __restrict__ src, __half* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -131,13 +126,6 @@ __global__ void convertFloatToHalf(const float* __restrict__ src, cutlass::half_
 
 
 
-//need to call cub for 32*32 blocks. Find max of each and then use warp reduce
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
 
 
 
@@ -145,45 +133,6 @@ __device__ float warpReduceMax(float val) {
 
 
 
-__global__ void transposeScaleCastFp8(
-    const float* __restrict__ src,   // Input FP32 matrix
-    const float* __restrict__ max_val, // Max value for scaling
-    cutlass::float_e4m3_t* __restrict__ dst, // Output FP8 matrix
-    int rows, int cols, int ld_src, int ld_dst) 
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-    for (; col < cols; col += gridDim.y * blockDim.y) {
-    float inv_max;
-    float scaled_val;
-
-        // Compute reciprocal of max_val using hardware reciprocal approximation
-    asm volatile ("rcp.approx.f32 %0, %1;" : "=f"(inv_max) : "f"(*max_val));
-
-    for (; row < rows; row += gridDim.x * blockDim.x) {
-
-            // Multiply instead of dividing (more efficient)
-            scaled_val = src[row + col*ld_src] * inv_max;
-
-            // Transpose and convert FP32 -> FP8 (E4M3)
-            dst[col + row*ld_dst] = float_to_fp8(scaled_val);
-        }
-    }
-}
-
-
-__global__ void floatToFp8E5M2Kernel(const float* __restrict__ src, uint8_t* __restrict__ dst, int rows, int cols, int ld_src, int ld_dst) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-
-    for (; row < rows; row += gridDim.x * blockDim.x) {
-        for (; col < cols; col += gridDim.y * blockDim.y) {
-            float val = src[row + col * ld_src];
-
-            dst[row + col * ld_dst] = float_to_fp8(val);
-        }
-    }
-}
 
 __global__ void Equilibrate_s1(const float* __restrict__ d_in, 
                                    int* __restrict__ D, int n, int ld)
@@ -209,8 +158,8 @@ __global__ void Equilibrate_s2(const float* __restrict__ d_in,
 }
 
 // Extract the diagonal (for a matrix in column-major order).
-__global__ void extractDiagonal(const double* __restrict__ d_in,
-                                double* __restrict__ D, int n, int ld, bool po2 = false)
+__global__ void extractDiagonal(const float* __restrict__ d_in,
+                                float* __restrict__ D, int n, int ld, bool po2 = false)
 {
     // Use a grid-stride loop over diagonal indices.
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -219,7 +168,7 @@ __global__ void extractDiagonal(const double* __restrict__ d_in,
     {
         int offset = i + i * ld;
         int exp = 0;
-        D[i] = d_in[offset];  
+        D[i] = float(d_in[offset]);  
     }
 }
 
@@ -344,6 +293,51 @@ __global__ void vanilla_Max(const double* __restrict__ vec, double* blockMax, in
         blockMax[blockIdx.x] = sdata[0];
     }
 }
+
+__global__ void infNormKernel(const double* __restrict__ A, double* rowSums, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+
+    double sum = 0.0f;
+    for (int col = 0; col < cols; ++col) {
+        sum += fabsf(A[col * rows + row]);  // Column-major access
+    }
+    rowSums[row] = sum;
+}
+
+__device__ double atomicMaxDouble(double* address, double val) {
+    unsigned long long int* addr_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *addr_as_ull, assumed;
+
+    do {
+        assumed = old;
+        old = atomicCAS(addr_as_ull, assumed,
+                        __double_as_longlong(fmax(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+
+    return __longlong_as_double(old);
+}
+
+__global__ void maxReduceKernel(const double* __restrict__ rowSums, double* result, int n) {
+    extern __shared__ double smaxdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+
+    smaxdata[tid] = (i < n) ? rowSums[i] : -DBL_MAX;
+    __syncthreads();
+
+    // Parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s)
+            smaxdata[tid] = fmax(smaxdata[tid], smaxdata[tid + s]);
+        __syncthreads();
+    }
+
+    // Write the block's local max to global result
+    if (tid == 0)
+        atomicMaxDouble(result, smaxdata[0]);
+}
+
 
 
 __global__ void vanilla_Max(const float* __restrict__ vec, float* blockMax, int n)

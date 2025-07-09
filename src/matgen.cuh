@@ -175,12 +175,7 @@ void randomOrthonormalMatrix(double* d_Q, int n,
 }
 
 
-// ---------------------------------------------------------------------------
-// Distribution type
-enum class DistType {
-    Geometric,
-    Arithmetic
-};
+
 
 // ---------------------------------------------------------------------------
 // 5. Generate a PSD matrix A = Q * Lambda * Q^T on the device.

@@ -1,9 +1,4 @@
-#include <thrust/device_vector.h>
-#include <thrust/reduce.h>
-#include <thrust/sequence.h>         // ✅ Include for thrust::sequence
-#include <thrust/transform_reduce.h>
-#include <thrust/transform.h>
-#include <cutlass/array.h>
+
 #include "kernels_macros.cuh"
 #include "fp8_utils.cuh"
 
@@ -19,24 +14,27 @@ enum class precisions : uint8_t {
     fp32 = 3
 };
 
-std::ofstream gemms_file("gemmers.csv");
 
-void switching_chol(float* d_A, int n, int b
+
+void switching_chol(float* d_A, int n, int b,
                     float* d_diagVals, float* updated_diag, float eps_prime, bool perturb_diag, int microscal_size,
-                    cuSolverDnHandle_t cusolverH, cublasLtHandle_t cublasltH,
+                    cusolverDnHandle_t cusolverH, cublasLtHandle_t cublasltH, cublasHandle_t cublasH,
                     cudaStream_t stream, uint8_t* scales) 
 {
 
     float one = 1.0f;
-    float negOne = -1.0f;
+    float neg_One = -1.0f;
 
     int devInfo_h = 0;
     int* devInfo  = nullptr;
     CUDA_CHECK( cudaMalloc((void**)&devInfo, sizeof(int)) );
+    void* d_workspace = nullptr;
+    size_t workspaceSize = 16 * 1024 * 1024; // 16 MB
+    cudaMalloc(&d_workspace, workspaceSize);
 
     __nv_fp8_e8m0* d_scales = reinterpret_cast<__nv_fp8_e8m0*>(scales);
 
-    //allocate n*r buffer for schur update
+    //allocate n*b buffer for schur update
     void* d_schur = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&d_schur, sizeof(float) * n * b));
 
@@ -52,14 +50,7 @@ void switching_chol(float* d_A, int n, int b
     int vecThreads = 256;
     int vecBlocks = (n * n + vecThreads - 1) / vecThreads;
 
-    float* updated_diag = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&updated_diag, n * sizeof(float)));
 
-    CUDA_CHECK(cudaMemcpy(updated_diag, d_diagVals, n * sizeof(float), cudaMemcpyDeviceToDevice));
-
-
-    float* dev_blockMax = nullptr;
-    CUDA_CHECK(cudaMalloc((void**)&dev_blockMax, vecBlocks * sizeof(float)));
 
     int num_blocks = (n + b - 1) / b;
     int lwork = 0;
@@ -67,12 +58,14 @@ void switching_chol(float* d_A, int n, int b
             cusolverDnSpotrf_bufferSize(
                 cusolverH,
                 CUBLAS_FILL_MODE_LOWER, // We'll store the factor in the "upper" part for row-major
-                r,                      // max block size
-                d_A_sub,                    // just pass a valid device pointer
-                ld,
+                b,                      // max block size
+                d_A,                    // just pass a valid device pointer
+                n,
                 &lwork
             )
         );
+
+    // Allocate workspace for Cholesky factorization
 
     float* panel_workspace = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&panel_workspace, sizeof(float)*lwork));
@@ -85,10 +78,6 @@ void switching_chol(float* d_A, int n, int b
         // (A) Copy the submatrix to device
         float* d_A_sub = d_A + start_row * n + start_row;
 
-        // (B) Convert to half precision if needed
-        // ... (conversion code here)
-        //need to get the 
-        
 
         // (C) Perform Cholesky factorization on the submatrix
         CUSOLVER_CHECK(cusolverDnSpotrf(
@@ -96,8 +85,8 @@ void switching_chol(float* d_A, int n, int b
             CUBLAS_FILL_MODE_LOWER,
             block_size,         // Size of submatrix (n x n)
             d_A_sub,            // Pointer to the submatrix
-            ld,                 // Leading dimension of d_A_sub
-            d_Workspace,        // Workspace (must be allocated)
+            n,                 // Leading dimension of d_A_sub
+            panel_workspace,        // Workspace (must be allocated)
             lwork,
             devInfo             // Info output
         ));
@@ -112,9 +101,9 @@ void switching_chol(float* d_A, int n, int b
             block_size, block_size, // Size of the submatrix
             &one,                   // Alpha
             d_A_sub,                // Pointer to the submatrix (L)
-            ld,                     // Leading dimension of d_A_sub
+            n,                     // Leading dimension of d_A_sub
             d_A_sub,                // Pointer to the submatrix (A)
-            ld                      // Leading dimension of d_A_sub
+            n                      // Leading dimension of d_A_sub
         ));
 
         //update the diagonal values
@@ -123,10 +112,11 @@ void switching_chol(float* d_A, int n, int b
         );
 
         //now decide which GEMM to use based on can_switch
+        float prec_3[3] = {MACH_EPS_E4M3, MACH_EPS_FP16, MACH_EPS_FP32};
         int * to_ret = nullptr;
         CUDA_CHECK(cudaMalloc((void**)&to_ret, sizeof(int)));
         can_switch<<<(block_size + 255) / 256, 256, 0, stream>>>(
-            d_diagVals + start_row, updated_diag + start_row,  {MACH_EPS_FP8, MACH_EPS_FP16, MACH_EPS_FP32}, 3, eps_prime, n - i*b, to_ret);
+            d_diagVals + start_row, updated_diag + start_row, prec_3 , 3, eps_prime, n - i*b, to_ret);
         
         if (to_ret[0] == 1) {
             // Use FP8 GEMM -- for this first round to fp8
@@ -134,60 +124,72 @@ void switching_chol(float* d_A, int n, int b
             convert_fp32_to_mxe4m3<<<(n*n + 255) / 256, 256, 0, stream>>>(
                 d_A_sub, // Input matrix in FP32
                 reinterpret_cast<__nv_fp8_e4m3*>(d_schur), // Output matrix in FP8
-                n,       // rows
-                r,       // cols
-                reinterpret_cast<__nv_fp8_e8m0*>(d_scales) // scale factors
+                n - i*b,       // rows
+                b,       // cols
+                (d_scales) // scale factors
             );
 
-            convert_transpose_fp32_to_mxe4m3<<<(n*n + 255) / 256, 256, , stream>>>(
+            convert_transpose_fp32_to_mxe4m3<<<(n*n + 255) / 256, 256,0 , stream>>>(
                 d_A_sub, // Input matrix in FP32
-                reinterpret_cast<__nv_fp8_e4m3*>(d_schur + n*r*sizeof(__half)), // Output matrix in FP8
-                n,       // rows
-                r,       // cols
-                reinterpret_cast<__nv_fp8_e8m0*>(d_scales + n*r*sizeof(__nv_fp8_e4m3)/32) // scale factors
+                reinterpret_cast<__nv_fp8_e4m3*>(d_schur + n*b*sizeof(__half)), // Output matrix in FP8
+                n - i*b,       // rows
+                b,       // cols
+                (d_scales + n*b*sizeof(__nv_fp8_e4m3)/32) // scale factors
             );
 
 
             LtMxfp8Matmul(
                 cublasltH,
-                d_A_sub, // A matrix
-                n,       // m
-                n,       // k
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n - i*b, // m
+                n - i*b, // n
+                b,       // k
+                &neg_One,    // alpha
+                d_scales, // A scale factors
+                reinterpret_cast<__nv_fp8_e4m3*>(d_schur), //A
                 n,       // lda
-                d_A_sub, // B matrix
-                n,       // k
-                n,       // n
+                reinterpret_cast<__nv_fp8_e8m0*>(d_scales + n*b*sizeof(__nv_fp8_e4m3)/32), // B scale factors
+                reinterpret_cast<__nv_fp8_e4m3*>(d_schur + n*b*sizeof(__half)), // B
                 n,       // ldb
-                &one,    // alpha
-                d_A_sub, // C matrix
+                &one, // beta
+                d_A + n*i*b + i*b, // C matrix
                 n,       // ldc
-                updated_diag + start_row, // D matrix
-                n        // ldd
+                d_A + n*i*b + i*b, // D matrix
+                n,       // ldd
+                d_workspace,            // workspace
+                workspaceSize,          // workspace size
+                CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0, // A scale mode
+                CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 // B scale mode
             );
 
         } else if (to_ret[0] == 2) {
             // Use FP16 GEMM --  round to FP16 first
-            convertFloattoHalf<<<(n*n + 255) / 256, 256, 0, stream>>>(
+            convertFloatToHalf<<<(n*n + 255) / 256, 256, 0, stream>>>(
                 d_A_sub, // Input matrix in FP32
                 reinterpret_cast<__half*>(d_schur), // Output matrix in FP16
                 n,       // rows
-                r        // cols
+                b,        // cols
+                n,          //ld_src
+                n           //ld_dst       
             );
             LtHSgemm_fp16in_fp32out(
                 cublasltH,
+                CUBLAS_OP_N,
+                CUBLAS_OP_T,
+                n - i*b,
+                n - i*b,
+                b,
+                &neg_One,    // alpha
                 reinterpret_cast<__half*>(d_schur), // A matrix in FP16
-                n,       // m
-                n,       // k
                 n,       // lda
-                reinterpret_cast<__half*>(d_schur + n*r*sizeof(__half)), // B matrix in FP16
-                n,       // k
-                n,       // n
+                reinterpret_cast<__half*>(d_schur + n*b*sizeof(__half)), // B matrix in FP16
                 n,       // ldb
-                &one,    // alpha
-                d_A_sub, // C matrix in FP32
+                &one,    // beta
+                d_A + n*i*b + i*b, // C matrix in FP32
                 n,       // ldc
-                updated_diag + start_row, // D matrix in FP32
-                n        // ldd
+                d_workspace, // workspace
+                workspaceSize // workspace size
             );
 
 
@@ -195,19 +197,21 @@ void switching_chol(float* d_A, int n, int b
             //use FP32 GEMM
             LtSgemm(
                 cublasltH,
-                d_A_sub, // A matrix in FP32
-                n,       // m
-                n,       // k
+                CUBLAS_OP_N,
+                CUBLAS_OP_T,
+                n - i*b, // m
+                n - i*b, // n
+                b,       // k
+                &neg_One,    // alpha
+                d_A_sub + b, // A matrix in FP32
                 n,       // lda
-                d_A_sub, // B matrix in FP32
-                n,       // k
-                n,       // n
+                d_A_sub + b, // B matrix in FP32
                 n,       // ldb
-                &one,    // alpha
-                d_A_sub, // C matrix in FP32
+                &one,    // beta
+                d_A + n*i*b + i*b, // C matrix in FP32
                 n,       // ldc
-                updated_diag + start_row, // D matrix in FP32
-                n        // ldd
+                d_workspace, // workspace
+                workspaceSize // workspace size
             );
 
         }

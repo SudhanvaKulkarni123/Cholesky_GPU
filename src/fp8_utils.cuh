@@ -32,21 +32,24 @@ __global__ void convert_fp32_to_mxe4m3(
     int total = rows*cols;
     for(int i = tid; i < total; i += blockDim.x*gridDim.x) {
     __nv_fp8_e8m0 exp;
-    exp = __nv_cvt_float_to_e8m0(input[i], __NV_SATFINITE, cudaRoundZero);
-
+   
+    float val;
     //warp reeduction
     for (int offset = 16; offset > 0; offset /= 2) {
-        int neighbor = __shfl_down_sync(0xffffffff, exp, offset);
-        exp = max(exp, neighbor);
+        val = fabs(input[i]);
+        float neighbor = __shfl_down_sync(0xffffffff, val, offset);
+        val = max(val, neighbor);
     }
+
+    val = __shfl_sync(0xffffffff, val, 0);  //thread 0 in the warp has max exp
+    exp = __nv_fp8_e8m0(val);
     
     if(i % 32 == 0) {
         encoded_scale[i / 32] = exp;
     }
 
-    int max_exp = __shfl_sync(0xffffffff, exp, 0);  //thread 0 in the warp has max exp
 
-    output[i] = __nv_cvt_float_to_fp8_e4m3(input[i] / (float)exp,   __NV_SATFINITE);
+    output[i] = __nv_fp8_e4m3(input[i] / (float)exp);
     }
 
     return;
@@ -72,7 +75,7 @@ __global__ void convert_transpose_fp32_to_mxe4m3(
     int tid_y = blockIdx.y * blockDim.y + threadIdx.y;
     
 
-    extern __shared__ float shared_data[][];
+    extern __shared__ float shared_data[TILE_DIM][TILE_DIM + 1];
     int x = blockIdx.x * TILE_DIM + threadIdx.x;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
     int width = gridDim.x * TILE_DIM;
@@ -83,23 +86,28 @@ __global__ void convert_transpose_fp32_to_mxe4m3(
     int total = rows*cols;
     //algo is simple. Tile transpose and before write back use warp reduction to find the max exp
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     tile[threadIdx.y+j][threadIdx.x] = input[(y+j)*width + x];
+     shared_data[threadIdx.y+j][threadIdx.x] = input[(y+j)*width + x];
 
     __syncthreads();
-
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+    float buf;
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
      for (int offset = 16; offset > 0; offset /= 2) {
         //warp reduction
-        auto buf = fabs(shared_data[threadIdx.y+j][threadIdx.x]) ;
+        buf = fabs(shared_data[threadIdx.y+j][threadIdx.x]) ;
         buf = max(buf, 
             __shfl_down_sync(0xffffffff, buf, offset));
-        exp = __nv_cvt_float_to_e8m0(buf, __NV_SATFINITE, cudaRoundZero);
+        }
+
+        buf = __shfl_sync(0xffffffff, buf, 0);
+
+        exp = __nv_fp8_e8m0(buf);
         if (((y+j)*width + x) % 32 == 0) {
             encoded_scale[((y+j)*width + x)/32] = exp;
         }
-       output[(y+j)*width + x] = __nv_cvt_float_to_fp8_e4m3(
-            tile[threadIdx.x][threadIdx.y + j] / (float)exp, __NV_SATFINITE);
-     }
+       output[(y+j)*width + x] = __nv_fp8_e4m3(
+            shared_data[threadIdx.x][threadIdx.y + j] / (float)exp);
+       }
+     
 
 
     return;
@@ -131,9 +139,8 @@ void LtMxfp8Matmul(cublasLtHandle_t ltHandle,
                  void *workspace,
                  size_t workspaceSize,
                  cublasLtMatmulMatrixScale_t AScaleMode,
-                 cublasLtMatmulMatrixScale_t BScaleMode,
-                 cublasLtMatmulMatrixScale_t CScaleMode,
-                 cublasLtMatmulMatrixScale_t DOutScaleMode) {
+                 cublasLtMatmulMatrixScale_t BScaleMode
+                 ) {
 
     cublasLtMatmulDesc_t operationDesc = NULL;
     cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL, Ddesc = NULL;
@@ -152,12 +159,10 @@ void LtMxfp8Matmul(cublasLtHandle_t ltHandle,
     // set block scaling mode
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &AScaleMode, sizeof(AScaleMode)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &BScaleMode, sizeof(BScaleMode)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_MODE, &DOutScaleMode, sizeof(DOutScaleMode)));
 
     // set scaling factors
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale, sizeof(b_scale)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER, &d_out_scale, sizeof(d_out_scale)));
 
     // create matrix descriptors, we are good with the details here so no need to set any extra attributes
     // table of supported type combinations can be found in the documentation: https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatmul
@@ -233,30 +238,30 @@ void LtSgemm(cublasLtHandle_t ltHandle,
 
     // create operation desciriptor; see cublasLtMatmulDescAttributes_t for details about defaults; here we just need to
     // set the transforms for A and B
-    checkCublasStatus(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    checkCublasStatus(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
-    checkCublasStatus(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
 
     // create matrix descriptors, we are good with the details here so no need to set any extra attributes
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, transa == CUBLAS_OP_N ? m : k, transa == CUBLAS_OP_N ? k : m, lda));
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_32F, transb == CUBLAS_OP_N ? k : n, transb == CUBLAS_OP_N ? n : k, ldb));
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, m, n, ldc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, transa == CUBLAS_OP_N ? m : k, transa == CUBLAS_OP_N ? k : m, lda));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_32F, transb == CUBLAS_OP_N ? k : n, transb == CUBLAS_OP_N ? n : k, ldb));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, m, n, ldc));
 
     // create preference handle; here we could use extra attributes to disable tensor ops or to make sure algo selected
     // will work with badly aligned A, B, C; here for simplicity we just assume A,B,C are always well aligned (e.g.
     // directly come from cudaMalloc)
-    checkCublasStatus(cublasLtMatmulPreferenceCreate(&preference));
-    checkCublasStatus(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
 
     // we just need the best available heuristic to try and run matmul. There is no guarantee this will work, e.g. if A
     // is badly aligned, you can request more (e.g. 32) algos and try to run them one by one until something works
-    checkCublasStatus(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
+    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
 
     if (returnedResults == 0) {
-        checkCublasStatus(CUBLAS_STATUS_NOT_SUPPORTED);
+        CUBLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
     }
 
-    checkCublasStatus(cublasLtMatmul(ltHandle,
+    CUBLAS_CHECK(cublasLtMatmul(ltHandle,
                                      operationDesc,
                                      alpha,
                                      A,
@@ -274,11 +279,11 @@ void LtSgemm(cublasLtHandle_t ltHandle,
                                      0));
 
     // descriptors are no longer needed as all GPU work was already enqueued
-    if (preference) checkCublasStatus(cublasLtMatmulPreferenceDestroy(preference));
-    if (Cdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Cdesc));
-    if (Bdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Bdesc));
-    if (Adesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Adesc));
-    if (operationDesc) checkCublasStatus(cublasLtMatmulDescDestroy(operationDesc));
+    if (preference) CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
+    if (Cdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+    if (Bdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+    if (Adesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+    if (operationDesc) CUBLAS_CHECK(cublasLtMatmulDescDestroy(operationDesc));
 }
 
 void LtHSgemm_fp16in_fp32out(cublasLtHandle_t      ltHandle,
@@ -310,35 +315,35 @@ void LtHSgemm_fp16in_fp32out(cublasLtHandle_t      ltHandle,
     /* -------------------------------------------------- *
      * 1. Operation descriptor – accumulate in FP32       *
      * -------------------------------------------------- */
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatmulDescCreate(&opDesc,
                                  CUBLAS_COMPUTE_32F,   // ⬅ Accumulation = FP32
                                  CUDA_R_32F));         // ⬅ Scale type   = FP32
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatmulDescSetAttribute(opDesc,
                                        CUBLASLT_MATMUL_DESC_TRANSA,
                                        &transa,
                                        sizeof(transa)));
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatmulDescSetAttribute(opDesc,
                                        CUBLASLT_MATMUL_DESC_TRANSB,
                                        &transb,
                                        sizeof(transb)));
 
 
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatrixLayoutCreate(&Adesc,
                                    CUDA_R_16F,          // ⬅ CHANGED: input in FP16
                                    (transa == CUBLAS_OP_N) ? m : k,
                                    (transa == CUBLAS_OP_N) ? k : m,
                                    lda));
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatrixLayoutCreate(&Bdesc,
                                    CUDA_R_16F,          // ⬅ CHANGED: input in FP16
                                    (transb == CUBLAS_OP_N) ? k : n,
                                    (transb == CUBLAS_OP_N) ? n : k,
                                    ldb));
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatrixLayoutCreate(&Cdesc,
                                    CUDA_R_32F,          // ⬅ output kept in FP32
                                    m,
@@ -346,14 +351,14 @@ void LtHSgemm_fp16in_fp32out(cublasLtHandle_t      ltHandle,
                                    ldc));
 
 
-    checkCublasStatus(cublasLtMatmulPreferenceCreate(&pref));
-    checkCublasStatus(cublasLtMatmulPreferenceSetAttribute(
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
         pref,
         CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
         &workspaceSize,
         sizeof(workspaceSize)));
 
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatmulAlgoGetHeuristic(ltHandle,
                                        opDesc,
                                        Adesc,
@@ -366,11 +371,11 @@ void LtHSgemm_fp16in_fp32out(cublasLtHandle_t      ltHandle,
                                        &returnedResults));
 
     if (returnedResults == 0) {
-        checkCublasStatus(CUBLAS_STATUS_NOT_SUPPORTED);
+        CUBLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
     }
 
 
-    checkCublasStatus(
+    CUBLAS_CHECK(
         cublasLtMatmul(ltHandle,
                        opDesc,
                        alpha,
@@ -384,9 +389,9 @@ void LtHSgemm_fp16in_fp32out(cublasLtHandle_t      ltHandle,
                        workspaceSize,
                        /* stream */ 0));
 
-    if (pref)  checkCublasStatus(cublasLtMatmulPreferenceDestroy(pref));
-    if (Cdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Cdesc));
-    if (Bdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Bdesc));
-    if (Adesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Adesc));
-    if (opDesc)checkCublasStatus(cublasLtMatmulDescDestroy(opDesc));
+    if (pref)  CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
+    if (Cdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+    if (Bdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+    if (Adesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+    if (opDesc)CUBLAS_CHECK(cublasLtMatmulDescDestroy(opDesc));
 }
