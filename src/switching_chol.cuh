@@ -42,6 +42,9 @@ void switching_chol(float* d_A, int n, int b,
     void* d_schur_16 = nullptr;
     void* d_schur_32 = nullptr;
 
+    d_schur_8 = reinterpret_cast<__nv_fp8_e4m3*>(d_schur);
+    d_schur_16 = reinterpret_cast<__half*>(d_schur);
+    d_schur_32 = reinterpret_cast<float*>(d_schur);
 
     
 
@@ -51,7 +54,7 @@ void switching_chol(float* d_A, int n, int b,
     int vecBlocks = (n * n + vecThreads - 1) / vecThreads;
 
 
-
+    
     int num_blocks = (n + b - 1) / b;
     int lwork = 0;
         CUSOLVER_CHECK(
@@ -60,8 +63,8 @@ void switching_chol(float* d_A, int n, int b,
                 CUBLAS_FILL_MODE_LOWER, // We'll store the factor in the "upper" part for row-major
                 b,                      // max block size
                 d_A,                    // just pass a valid device pointer
-                n,
-                &lwork
+                n,                      //ld
+                &lwork                   //pointer to int for size of buffer
             )
         );
 
@@ -98,43 +101,44 @@ void switching_chol(float* d_A, int n, int b,
             CUBLAS_FILL_MODE_LOWER,
             CUBLAS_OP_N,
             CUBLAS_DIAG_NON_UNIT,
-            block_size, block_size, // Size of the submatrix
+            n - start_row, block_size, // Size of the submatrix
             &one,                   // Alpha
             d_A_sub,                // Pointer to the submatrix (L)
             n,                     // Leading dimension of d_A_sub
-            d_A_sub,                // Pointer to the submatrix (A)
+            d_A_sub + block_size,                // Pointer to the submatrix (A)
             n                      // Leading dimension of d_A_sub
         ));
 
         //update the diagonal values
-        update_diag<<<(block_size + 255) / 256, 256, 0, stream>>>(
-            updated_diag + start_row, d_A_sub + block_size,n - i*block_size, block_size, n 
-        );
+        update_diag<<<(n - start_row)/256, 256, 0, stream>>>(
+            updated_diag + start_row, d_A_sub + block_size, n - start_row, block_size, n 
+        );      //looks correct!
 
         //now decide which GEMM to use based on can_switch
-        float prec_3[3] = {MACH_EPS_E4M3, MACH_EPS_FP16, MACH_EPS_FP32};
+        float prec_3[3] = {MACH_EPS_FP32, MACH_EPS_FP16 ,MACH_EPS_E4M3};
         int * to_ret = nullptr;
         CUDA_CHECK(cudaMalloc((void**)&to_ret, sizeof(int)));
-        can_switch<<<(block_size + 255) / 256, 256, 0, stream>>>(
-            d_diagVals + start_row, updated_diag + start_row, prec_3 , 3, eps_prime, n - i*b, to_ret);
+        can_switch<<<(n - start_row)/256, 256, 0, stream>>>(
+            d_diagVals + start_row, updated_diag + start_row, prec_3 , 3, eps_prime, n - start_row, to_ret);    //fixed
         
-        if (to_ret[0] == 1) {
+        if (to_ret[0] == 0) {
             // Use FP8 GEMM -- for this first round to fp8
-
             convert_fp32_to_mxe4m3<<<(n*n + 255) / 256, 256, 0, stream>>>(
-                d_A_sub, // Input matrix in FP32
+                d_A_sub + b, // Input matrix in FP32
                 reinterpret_cast<__nv_fp8_e4m3*>(d_schur), // Output matrix in FP8
                 n - i*b,       // rows
                 b,       // cols
-                (d_scales) // scale factors
+                (d_scales), // scale factors
+                n   //ld
             );
 
             convert_transpose_fp32_to_mxe4m3<<<(n*n + 255) / 256, 256,0 , stream>>>(
-                d_A_sub, // Input matrix in FP32
+                d_A_sub + b, // Input matrix in FP32
                 reinterpret_cast<__nv_fp8_e4m3*>(d_schur + n*b*sizeof(__half)), // Output matrix in FP8
                 n - i*b,       // rows
                 b,       // cols
-                (d_scales + n*b*sizeof(__nv_fp8_e4m3)/32) // scale factors
+                (d_scales + n*b*sizeof(__nv_fp8_e4m3)/32), // scale factors
+                n           //ld
             );
 
 
@@ -163,12 +167,12 @@ void switching_chol(float* d_A, int n, int b,
                 CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 // B scale mode
             );
 
-        } else if (to_ret[0] == 2) {
+        } else if (to_ret[0] == 1) {
             // Use FP16 GEMM --  round to FP16 first
             convertFloatToHalf<<<(n*n + 255) / 256, 256, 0, stream>>>(
                 d_A_sub, // Input matrix in FP32
                 reinterpret_cast<__half*>(d_schur), // Output matrix in FP16
-                n,       // rows
+                n - i*b,       // rows
                 b,        // cols
                 n,          //ld_src
                 n           //ld_dst       

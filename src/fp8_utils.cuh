@@ -23,34 +23,43 @@ float warpReduceMax(float val) {
 
 
 
-// Convert FP32 → FP8 with a shared scaling factor
+// Convert FP32 → FP8 with a shared scaling factor, note -> CUDA does rowmajor, so I need to warp reduce on y
 __global__ void convert_fp32_to_mxe4m3(
     const float* input, __nv_fp8_e4m3* output,
-    int rows, int cols, __nv_fp8_e8m0* encoded_scale)
+    int rows, int cols, __nv_fp8_e8m0* encoded_scale, int ld)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = rows*cols;
-    for(int i = tid; i < total; i += blockDim.x*gridDim.x) {
-    __nv_fp8_e8m0 exp;
-   
-    float val;
-    //warp reeduction
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fabs(input[i]);
-        float neighbor = __shfl_down_sync(0xffffffff, val, offset);
-        val = max(val, neighbor);
-    }
+    int tid_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid_y = blockIdx.y * blockDim.y + threadIdx.y;
+    //use tid_x for row and tid_y for col
+    for(int i = tid_x; i < rows; i += blockDim.x*gridDim.x) {
 
-    val = __shfl_sync(0xffffffff, val, 0);  //thread 0 in the warp has max exp
-    exp = __nv_fp8_e8m0(val);
+        for(int j = tid_y; j < cols; j += blockDim.y*gridDim.y) {
+
+            __nv_fp8_e8m0 exp;
+            
+            float val;
+            //warp reeduction
+            for (int offset = 16; offset > 0; offset /= 2) {
+                val = fabs(input[ld*i + j]);
+                float neighbor = __shfl_down_sync(0xffffffff, val, offset);
+                val = max(val, neighbor);
+            }
+
+            val = __shfl_sync(0xffffffff, val, 0);  //thread 0 in the warp has max exp
+            exp = __nv_fp8_e8m0(val);
+
+            //computes max over 32 elem!
+            
+            if((ld*i + j) % 32 == 0) {
+                encoded_scale[(ld*i + j) / 32] = exp;
+            }
+
+
+            output[(ld*i + j)] = __nv_fp8_e4m3(input[ld*i + j] / (float)exp);
+            }
+
+        }
     
-    if(i % 32 == 0) {
-        encoded_scale[i / 32] = exp;
-    }
-
-
-    output[i] = __nv_fp8_e4m3(input[i] / (float)exp);
-    }
 
     return;
     
@@ -69,22 +78,28 @@ __global__ void convert_fp32_to_mxe4m3(
 
 __global__ void convert_transpose_fp32_to_mxe4m3(
     const float* input, __nv_fp8_e4m3* output,
-    int rows, int cols, __nv_fp8_e8m0* encoded_scale)
+    int rows, int cols, __nv_fp8_e8m0* encoded_scale, int ld)
 {
-    int tid_x = blockIdx.x * blockDim.x + threadIdx.x;
-    int tid_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    /*
+    ---------------
+    |   A00    A01  |``access A(i,j) with tid_x and tid_y - set TILE_DIM = block_dim. In this case, block of thread also means panel
+    |               |   But 1D grid, so the grid ordering is technically A00, A01, A10, A11
+    |    A10   A11  |
+    |               |
+    ----------------
+    */
     
 
     extern __shared__ float shared_data[TILE_DIM][TILE_DIM + 1];
-    int x = blockIdx.x * TILE_DIM + threadIdx.x;
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    int width = gridDim.x * TILE_DIM;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int width = gridDim.x * ld;
 
     __nv_fp8_e8m0 exp;
 
-
-    int total = rows*cols;
-    //algo is simple. Tile transpose and before write back use warp reduction to find the max exp
+    //algo is simple. Tile transpose and before write back use warp reduction to find the max exp. 
+    //TBH don;t really need warp reduction since it it in shared data, but ist fine
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
      shared_data[threadIdx.y+j][threadIdx.x] = input[(y+j)*width + x];
 
